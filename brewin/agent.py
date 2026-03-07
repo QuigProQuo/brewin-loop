@@ -111,11 +111,14 @@ def run_cycle(
     if model:
         cmd.extend(["--model", model])
 
-    if system_prompt and system_prompt.strip():
-        cmd.extend(["--system-prompt", system_prompt])
-
     if session_id and continue_session:
+        # Continuing an existing session — cannot override system prompt,
+        # but can append additional context via --append-system-prompt.
         cmd.extend(["--session-id", session_id])
+        if system_prompt and system_prompt.strip():
+            cmd.extend(["--append-system-prompt", system_prompt])
+    elif system_prompt and system_prompt.strip():
+        cmd.extend(["--system-prompt", system_prompt])
 
     cmd.append(user_message)
 

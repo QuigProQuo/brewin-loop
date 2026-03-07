@@ -218,6 +218,8 @@ def _run_micro_replan(
     )
 
     console.print("  [dim]Running micro-replan...[/dim]")
+    # Always use a fresh session — micro-replan has its own system prompt
+    # and continuing the work cycle's session would ignore it.
     result = run_cycle(
         user_message=prompt,
         system_prompt=(
@@ -225,8 +227,8 @@ def _run_micro_replan(
             "You do NOT write application code. Be concise and fast."
         ),
         model=config.replan_model or config.model,
-        session_id=state.claude_session_id if state.claude_session_id else None,
-        continue_session=bool(state.claude_session_id),
+        session_id=None,
+        continue_session=False,
         timeout=120,
     )
 
