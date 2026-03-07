@@ -18,7 +18,6 @@ import os
 import re
 import sys
 import time
-import uuid
 from datetime import datetime, timezone
 
 from rich.console import Console
@@ -243,7 +242,8 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
                          initial_direction: str | None = None,
                          wrapping_up: bool = False,
                          cycle_type_addendum: str = "",
-                         health_context: str = "") -> str:
+                         health_context: str = "",
+                         timeout_context: str = "") -> str:
     """Build the full system prompt for cycle 1."""
     prompt = BREWIN_SYSTEM_PROMPT
     sections = []
@@ -300,6 +300,10 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
     # Health check results from previous cycle
     if health_context:
         sections.append(f"## Project Health\n{health_context}")
+
+    # Timeout context from previous cycle
+    if timeout_context:
+        sections.append(f"## Previous Cycle Stalled\n{timeout_context}")
 
     # Time
     remaining = state.format_time_remaining(config.time_budget_minutes)
@@ -423,7 +427,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             f"[bold]Resuming Brewin[/bold]\n"
             f"  Cycles done: [cyan]{state.cycle_count}[/cyan]\n"
             f"  New budget:  [cyan]{config.time_budget_minutes}m[/cyan]\n"
-            f"  Session:     [dim]{state.claude_session_id[:12]}...[/dim]",
+            f"  Session:     [dim]{state.session_id}[/dim]",
             border_style="yellow",
         ))
     else:
@@ -431,7 +435,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         state.start_time = time.time()
         state.project_root = os.getcwd()
         state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        state.claude_session_id = str(uuid.uuid4())
+        state.claude_session_id = ""
 
     project_type = detect_project_type()
 
@@ -442,7 +446,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             f"  Project:      [cyan]{project_type}[/cyan]\n"
             f"  Model:        [cyan]{config.model}[/cyan]\n"
             f"  Mode:         [cyan]{config.autonomy_mode}[/cyan]\n"
-            f"  Session:      [dim]{state.claude_session_id[:12]}...[/dim]"
+            f"  Session:      [dim]{state.session_id}[/dim]"
             + (f"\n  Direction:    [green]{initial_direction}[/green]"
                if initial_direction else ""),
             border_style="bold blue",
@@ -451,6 +455,9 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
     cycle = state.cycle_count
     last_outcome: str | None = None
     last_health_context = ""
+    last_timeout_context = ""
+    consecutive_stalls = 0
+    consecutive_failures = 0
 
     while not state.is_time_up(config.time_budget_minutes):
         cycle += 1
@@ -468,6 +475,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         cycle_type = select_cycle_type(
             cycle, last_outcome, wrapping_up,
             override=config.cycle_type_override,
+            consecutive_stalls=consecutive_stalls,
         )
 
         remaining = state.format_time_remaining(config.time_budget_minutes)
@@ -516,6 +524,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             wrapping_up=wrapping_up,
             cycle_type_addendum=cycle_type.prompt_addendum,
             health_context=last_health_context,
+            timeout_context=last_timeout_context,
         )
 
         if is_first_cycle:
@@ -530,6 +539,12 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             # Include health context if available
             if last_health_context:
                 user_message += f"\n\n## Project Health\n{last_health_context}"
+            # Include timeout context if previous cycle stalled
+            if last_timeout_context:
+                user_message += f"\n\n## Previous Cycle Stalled\n{last_timeout_context}"
+
+        # Use config.cycle_timeout if set, otherwise cycle type timeout (usually None)
+        effective_timeout = config.cycle_timeout if config.cycle_timeout is not None else cycle_type.timeout
 
         cycle_result = run_cycle(
             user_message=user_message,
@@ -537,7 +552,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             model=config.model,
             session_id=state.claude_session_id if use_session_continuity else None,
             continue_session=use_session_continuity,
-            timeout=cycle_type.timeout,
+            timeout=effective_timeout,
         )
 
         # Update session ID from Claude's response (in case it changed)
@@ -552,10 +567,19 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         summary = parsed.get("cycle_summary", "")
 
         # Override outcome if the cycle was killed/errored
-        if cycle_result.is_error and outcome not in ("failed",):
-            outcome = "failed"
-            if not summary:
-                summary = "Cycle terminated abnormally"
+        if cycle_result.is_error:
+            if cycle_result.timeout_type == "stall":
+                outcome = "stalled"
+                if not summary:
+                    summary = "Cycle stalled (no output for 5 min, work auto-saved)"
+            elif cycle_result.timeout_type == "duration":
+                outcome = "timed_out"
+                if not summary:
+                    summary = "Cycle hit duration limit (work auto-saved)"
+            elif outcome not in ("failed",):
+                outcome = "failed"
+                if not summary:
+                    summary = "Cycle terminated abnormally"
 
         # Independent health check
         health = run_health_check(
@@ -569,8 +593,11 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             health.build_ok, health.tests_ok, health.test_output,
         )
 
-        # Rollback on verified failure
-        if not health.passed and config.rollback_on_failure and checkpoint.success:
+        # Rollback on verified failure — but NOT when partial work was saved
+        # (stalled/timed_out cycles have auto-saved WIP commits to preserve)
+        has_saved_partial = cycle_result.timeout_type in ("stall", "duration")
+        if (not health.passed and config.rollback_on_failure
+                and checkpoint.success and not has_saved_partial):
             console.print(
                 f"[red]Health check failed after cycle {cycle}. "
                 f"Rolling back to {checkpoint.tag}[/red]"
@@ -582,7 +609,54 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             state.claude_session_id = ""
             console.print("  [dim]Session reset (rollback invalidated context)[/dim]")
 
+        # Reset session on failure so next cycle gets a fresh full prompt
+        if outcome == "failed" and state.claude_session_id:
+            state.claude_session_id = ""
+            console.print("  [dim]Session reset (cycle failed)[/dim]")
+
         last_outcome = outcome
+
+        # Consecutive failure cap — stop burning cycles on structural failures
+        if outcome == "failed":
+            consecutive_failures += 1
+            if consecutive_failures >= 3:
+                console.print(
+                    "[red]3 consecutive failures — stopping to avoid "
+                    "wasting cycles.[/red]"
+                )
+                break
+        else:
+            consecutive_failures = 0
+
+        # Build timeout context for the next cycle if this one stalled/timed out
+        if outcome in ("stalled", "timed_out"):
+            consecutive_stalls += 1
+            timeout_parts = [
+                f"The previous cycle (cycle {cycle}, type={cycle_type.name}) "
+                f"{'stalled' if outcome == 'stalled' else 'hit its duration limit'} "
+                f"after {cycle_duration:.0f}s.",
+                f"It was working on: {focus}",
+            ]
+            if cycle_result.partial_diff_stat:
+                timeout_parts.append(
+                    f"\nPartial work saved (auto-committed):\n"
+                    f"```\n{cycle_result.partial_diff_stat}\n```"
+                )
+            if cycle_result.partial_diff:
+                timeout_parts.append(
+                    f"\nActual changes (diff):\n"
+                    f"```diff\n{cycle_result.partial_diff}\n```"
+                )
+            if cycle_result.output:
+                last_output = cycle_result.output[-1000:]
+                timeout_parts.append(
+                    f"\nLast output from the interrupted cycle:\n"
+                    f"```\n{last_output}\n```"
+                )
+            last_timeout_context = "\n".join(timeout_parts)
+        else:
+            consecutive_stalls = 0
+            last_timeout_context = ""
 
         state.log_cycle(
             focus, outcome,
@@ -595,8 +669,8 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         mgr.save(state)
 
         style = "green" if outcome == "success" else "yellow"
-        if outcome == "failed":
-            style = "red"
+        if outcome in ("failed", "stalled", "timed_out"):
+            style = "red" if outcome == "failed" else "yellow"
         tokens_str = f"{cycle_result.input_tokens:,}in / {cycle_result.output_tokens:,}out"
         health_str = ""
         if health.build_ok is not None or health.tests_ok is not None:
@@ -622,7 +696,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
 
         # Micro-replan: quick task update after work cycles (not after replan/planning)
         if (config.micro_replan
-                and cycle_type.name in ("deep_work", "quick_fix")
+                and cycle_type.name in ("deep_work", "quick_fix", "continue_work")
                 and outcome != "failed"
                 and not wrapping_up):
             replan_result = _run_micro_replan(

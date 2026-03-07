@@ -9,14 +9,14 @@ from dataclasses import dataclass
 @dataclass
 class CycleType:
     name: str
-    timeout: int  # seconds for claude -p stall timeout
+    timeout: int | None  # None = no duration limit (stall detection only)
     prompt_addendum: str
 
 
 CYCLE_TYPES: dict[str, CycleType] = {
     "planning": CycleType(
         name="planning",
-        timeout=300,
+        timeout=None,
         prompt_addendum=(
             "## CYCLE MODE: PLANNING\n"
             "This is a planning cycle. Analyze the project, understand the current "
@@ -27,7 +27,7 @@ CYCLE_TYPES: dict[str, CycleType] = {
     ),
     "quick_fix": CycleType(
         name="quick_fix",
-        timeout=300,
+        timeout=None,
         prompt_addendum=(
             "## CYCLE MODE: QUICK FIX\n"
             "This is a quick-fix cycle. Focus on a single small fix, improvement, "
@@ -37,16 +37,16 @@ CYCLE_TYPES: dict[str, CycleType] = {
     ),
     "deep_work": CycleType(
         name="deep_work",
-        timeout=1800,
+        timeout=None,
         prompt_addendum=(
             "## CYCLE MODE: DEEP WORK\n"
-            "You have extended time for this cycle. Tackle complex features, "
-            "multi-file changes, or deep refactors. Take the time to do it right."
+            "Tackle complex features, multi-file changes, or deep refactors. "
+            "Take the time to do it right."
         ),
     ),
     "review": CycleType(
         name="review",
-        timeout=600,
+        timeout=None,
         prompt_addendum=(
             "## CYCLE MODE: REVIEW\n"
             "This is an audit cycle. Review code quality, find bugs, update tests, "
@@ -56,7 +56,7 @@ CYCLE_TYPES: dict[str, CycleType] = {
     ),
     "replan": CycleType(
         name="replan",
-        timeout=300,
+        timeout=None,
         prompt_addendum=(
             "## CYCLE MODE: REPLAN\n"
             "This is a replanning cycle. Do NOT write application code.\n\n"
@@ -73,6 +73,21 @@ CYCLE_TYPES: dict[str, CycleType] = {
             "if they're high-value."
         ),
     ),
+    "continue_work": CycleType(
+        name="continue_work",
+        timeout=None,
+        prompt_addendum=(
+            "## CYCLE MODE: CONTINUE INTERRUPTED WORK\n"
+            "The previous cycle stalled or was interrupted. Partial changes were "
+            "auto-saved as a WIP commit.\n\n"
+            "Your job:\n"
+            "1. Review the partial work details below.\n"
+            "2. If MOSTLY COMPLETE: finish, test, and commit properly.\n"
+            "3. If BROKEN or INCOHERENT: revert and decompose into smaller tasks "
+            "in .brewin/tasks.md.\n"
+            "4. Do NOT just retry the same approach that stalled."
+        ),
+    ),
 }
 
 
@@ -82,18 +97,26 @@ def select_cycle_type(
     wrapping_up: bool,
     override: str | None = None,
     replan_interval: int = 0,
+    consecutive_stalls: int = 0,
 ) -> CycleType:
     """Auto-select the appropriate cycle type based on context.
 
     Args:
         replan_interval: If > 0, insert a replan cycle every N work cycles.
             E.g., replan_interval=4 means cycles 5, 9, 13... are replan cycles.
+        consecutive_stalls: Number of consecutive stalled cycles. After 2+,
+            escalate to replan instead of continue_work.
     """
     if override and override in CYCLE_TYPES:
         return CYCLE_TYPES[override]
 
     if wrapping_up:
         return CYCLE_TYPES["quick_fix"]
+
+    if last_outcome in ("stalled", "timed_out"):
+        if consecutive_stalls >= 2:
+            return CYCLE_TYPES["replan"]
+        return CYCLE_TYPES["continue_work"]
 
     if last_outcome == "failed":
         return CYCLE_TYPES["review"]

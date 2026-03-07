@@ -29,6 +29,9 @@ class CycleResult:
     session_id: str = ""
     is_error: bool = False
     num_turns: int = 0
+    timeout_type: str = ""  # "", "stall", or "duration"
+    partial_diff_stat: str = ""
+    partial_diff: str = ""
 
 
 def _find_claude_cli() -> str:
@@ -44,6 +47,44 @@ def _find_claude_cli() -> str:
         if os.path.isfile(c):
             return c
     raise FileNotFoundError("claude CLI not found")
+
+
+def _save_partial_work(work_dir: str) -> tuple[str, str] | None:
+    """Auto-commit uncommitted changes as a WIP save.
+    Returns (diff_stat, diff) if there were changes, None otherwise."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=work_dir, timeout=10,
+        )
+        if not status.stdout.strip():
+            return None
+
+        # Stage everything first so we capture new untracked files in the diff
+        subprocess.run(
+            ["git", "add", "-A"], cwd=work_dir, timeout=10,
+        )
+
+        diff_stat = subprocess.run(
+            ["git", "diff", "--cached", "--stat"],
+            capture_output=True, text=True, cwd=work_dir, timeout=10,
+        )
+        diff_detail = subprocess.run(
+            ["git", "diff", "--cached"],
+            capture_output=True, text=True, cwd=work_dir, timeout=10,
+        )
+
+        subprocess.run(
+            ["git", "commit", "-m",
+             "brewin: WIP auto-save (cycle stalled)"],
+            cwd=work_dir, timeout=10,
+        )
+
+        console.print("  [yellow]Partial work auto-saved as WIP commit[/yellow]")
+        return (diff_stat.stdout.strip(), diff_detail.stdout.strip())
+    except Exception as e:
+        console.print(f"  [dim red]Failed to save partial work: {e}[/dim red]")
+        return None
 
 
 def run_cycle(
@@ -102,19 +143,35 @@ def run_cycle(
         stall_limit = STALL_TIMEOUT
         max_duration = timeout  # None means no hard cap
 
-        # Watchdog thread for stall detection and max duration
+        # Watchdog thread for stall detection and optional max duration
         stalled = threading.Event()
         was_killed = threading.Event()
+        timeout_reason = ""  # "stall" or "duration"
+        saved_diff: tuple[str, str] | None = None
 
-        def _kill_proc(reason: str):
-            """Terminate process, escalate to SIGKILL if needed."""
+        def _kill_proc(reason: str, kill_type: str = "stall"):
+            """Terminate process, save partial work, escalate to SIGKILL."""
+            nonlocal timeout_reason, saved_diff
+            timeout_reason = kill_type
             was_killed.set()
             stalled.set()
+
+            # Stop Claude first
             proc.terminate()
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+            # Save any uncommitted work before it's lost
+            saved_diff = _save_partial_work(cwd or os.getcwd())
+
+            # Ensure process is dead
+            try:
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+
             console.print(f"\n[red]{reason}[/red]")
 
         def watchdog():
@@ -123,18 +180,20 @@ def run_cycle(
                 stall_elapsed = now - last_output_time
                 total_elapsed = now - start_time
 
-                # Check max duration first
+                # Check optional max duration first
                 if max_duration and total_elapsed > max_duration:
                     _kill_proc(
                         f"Cycle duration limit reached ({max_duration}s). "
-                        "Terminating."
+                        "Terminating.",
+                        kill_type="duration",
                     )
                     return
 
                 if stall_elapsed > stall_limit:
                     _kill_proc(
                         f"Stall detected ({stall_limit}s with no output). "
-                        "Terminating cycle."
+                        "Terminating cycle.",
+                        kill_type="stall",
                     )
                     return
                 time.sleep(5)
@@ -165,6 +224,10 @@ def run_cycle(
         # Mark as error if process was killed by watchdog
         if was_killed.is_set():
             result.is_error = True
+            result.timeout_type = timeout_reason
+            if saved_diff:
+                result.partial_diff_stat = saved_diff[0]
+                result.partial_diff = saved_diff[1][:3000]
             if not result.output:
                 result.output = "(Cycle terminated by watchdog)"
 

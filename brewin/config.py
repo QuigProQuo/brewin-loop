@@ -40,6 +40,7 @@ class BrewinConfig:
 
     # Cycle types
     cycle_type_override: str | None = None  # Force a specific cycle type
+    cycle_timeout: int | None = None  # Optional per-cycle duration limit (seconds)
 
     # Replanning
     micro_replan: bool = True  # Run a quick task-update call after each work cycle
@@ -120,6 +121,9 @@ def load_config(**overrides) -> BrewinConfig:
 
     if "cycle_type" in toml_data:
         config.cycle_type_override = toml_data["cycle_type"]
+
+    if "cycle_timeout" in toml_data:
+        config.cycle_timeout = int(toml_data["cycle_timeout"])
 
     if "replan" in toml_data:
         replan = toml_data["replan"]
