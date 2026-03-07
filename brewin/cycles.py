@@ -73,6 +73,21 @@ CYCLE_TYPES: dict[str, CycleType] = {
             "if they're high-value."
         ),
     ),
+    "heal": CycleType(
+        name="heal",
+        timeout=None,
+        prompt_addendum=(
+            "## CYCLE MODE: HEAL (Fix Broken Baseline)\n"
+            "The project's build or tests are ALREADY FAILING before you start.\n"
+            "Your ONLY job is to get the project back to a healthy state.\n\n"
+            "1. Read the health check output below carefully.\n"
+            "2. Diagnose why the build/tests are failing.\n"
+            "3. Fix the failures with minimal, targeted changes.\n"
+            "4. Run the build/tests yourself to verify they pass.\n"
+            "5. Commit the fix.\n\n"
+            "Do NOT start feature work. Do NOT refactor. Just heal the project."
+        ),
+    ),
     "continue_work": CycleType(
         name="continue_work",
         timeout=None,
@@ -98,6 +113,7 @@ def select_cycle_type(
     override: str | None = None,
     replan_interval: int = 0,
     consecutive_stalls: int = 0,
+    baseline_healthy: bool = True,
 ) -> CycleType:
     """Auto-select the appropriate cycle type based on context.
 
@@ -106,9 +122,15 @@ def select_cycle_type(
             E.g., replan_interval=4 means cycles 5, 9, 13... are replan cycles.
         consecutive_stalls: Number of consecutive stalled cycles. After 2+,
             escalate to replan instead of continue_work.
+        baseline_healthy: Whether the project was healthy at session start.
+            If False, the first cycle(s) will be heal cycles until health passes.
     """
     if override and override in CYCLE_TYPES:
         return CYCLE_TYPES[override]
+
+    # Heal mode takes priority — project must be healthy before real work starts
+    if not baseline_healthy:
+        return CYCLE_TYPES["heal"]
 
     if wrapping_up:
         return CYCLE_TYPES["quick_fix"]

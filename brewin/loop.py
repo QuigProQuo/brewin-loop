@@ -28,7 +28,7 @@ from brewin.config import BrewinConfig, load_config, detect_project_type
 from brewin.state import BrewinState, StateManager
 from brewin.agent import run_cycle, CycleResult
 from brewin.checkpoint import create_checkpoint, rollback_to_checkpoint, cleanup_checkpoints
-from brewin.healthcheck import run_health_check
+from brewin.healthcheck import run_health_check, health_regressed, HealthCheckResult
 from brewin.context import get_git_context, get_project_tree, get_health_summary
 from brewin.cycles import select_cycle_type
 from brewin.hooks import run_hooks, build_hook_env
@@ -452,6 +452,25 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             border_style="bold blue",
         ))
 
+    # Baseline health check — know if project is already broken before we start
+    baseline_health = HealthCheckResult(passed=True)
+    baseline_healthy = True
+    if config.health_check_build or config.health_check_test:
+        console.print("[dim]Running baseline health check...[/dim]")
+        baseline_health = run_health_check(
+            build_cmd=config.health_check_build,
+            test_cmd=config.health_check_test,
+            timeout=config.health_check_timeout,
+        )
+        baseline_healthy = baseline_health.passed
+        if not baseline_healthy:
+            console.print(Panel(
+                "[red bold]Baseline health check FAILED[/red bold]\n"
+                "The project is already broken. Entering heal mode to fix "
+                "build/test failures before starting real work.",
+                border_style="red",
+            ))
+
     cycle = state.cycle_count
     last_outcome: str | None = None
     last_health_context = ""
@@ -476,6 +495,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             cycle, last_outcome, wrapping_up,
             override=config.cycle_type_override,
             consecutive_stalls=consecutive_stalls,
+            baseline_healthy=baseline_healthy,
         )
 
         remaining = state.format_time_remaining(config.time_budget_minutes)
@@ -517,18 +537,32 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         is_first_cycle = (cycle == 1) or not state.claude_session_id
         use_session_continuity = not is_first_cycle
 
+        # For heal cycles, inject baseline failure details as health context
+        heal_health_context = last_health_context
+        if cycle_type.name == "heal" and not heal_health_context:
+            heal_health_context = get_health_summary(
+                baseline_health.build_ok, baseline_health.tests_ok,
+                baseline_health.test_output,
+            )
+
         # Always build system prompt — session continuity may not work in -p mode
         system_prompt = _build_system_prompt(
             state, config,
             initial_direction=initial_direction if is_first_cycle else None,
             wrapping_up=wrapping_up,
             cycle_type_addendum=cycle_type.prompt_addendum,
-            health_context=last_health_context,
+            health_context=heal_health_context,
             timeout_context=last_timeout_context,
         )
 
         if is_first_cycle:
-            user_message = "Start a new development cycle. What's next?"
+            if cycle_type.name == "heal":
+                user_message = (
+                    "The project's build/tests are failing. Fix them before "
+                    "starting any feature work."
+                )
+            else:
+                user_message = "Start a new development cycle. What's next?"
         else:
             user_message = _build_continuation_prompt(
                 state, config, wrapping_up=wrapping_up,
@@ -581,33 +615,51 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                 if not summary:
                     summary = "Cycle terminated abnormally"
 
-        # Independent health check
-        health = run_health_check(
-            build_cmd=config.health_check_build,
-            test_cmd=config.health_check_test,
-            timeout=config.health_check_timeout,
-        )
+        # Independent health check — skip for non-code cycles
+        non_code_cycles = ("planning", "replan")
+        if cycle_type.name in non_code_cycles:
+            health = HealthCheckResult(passed=True)
+            health.build_ok = None
+            health.tests_ok = None
+            last_health_context = ""
+            console.print("  [dim]Health check skipped (non-code cycle)[/dim]")
+        else:
+            health = run_health_check(
+                build_cmd=config.health_check_build,
+                test_cmd=config.health_check_test,
+                timeout=config.health_check_timeout,
+            )
+            last_health_context = get_health_summary(
+                health.build_ok, health.tests_ok, health.test_output,
+            )
 
-        # Build health context for next cycle's prompt
-        last_health_context = get_health_summary(
-            health.build_ok, health.tests_ok, health.test_output,
-        )
-
-        # Rollback on verified failure — but NOT when partial work was saved
-        # (stalled/timed_out cycles have auto-saved WIP commits to preserve)
+        # Rollback only on REGRESSION — if baseline was already broken and the
+        # cycle didn't make it worse, keep the work.
         has_saved_partial = cycle_result.timeout_type in ("stall", "duration")
-        if (not health.passed and config.rollback_on_failure
+        regressed = health_regressed(baseline_health, health)
+        if (regressed and config.rollback_on_failure
                 and checkpoint.success and not has_saved_partial):
             console.print(
-                f"[red]Health check failed after cycle {cycle}. "
+                f"[red]Health REGRESSED after cycle {cycle}. "
                 f"Rolling back to {checkpoint.tag}[/red]"
             )
             rollback_to_checkpoint(checkpoint.tag)
             outcome = "failed"
-            summary += " (rolled back — health check failed)"
+            summary += " (rolled back — health regressed)"
             # Reset Claude session — its context is now stale after rollback
             state.claude_session_id = ""
             console.print("  [dim]Session reset (rollback invalidated context)[/dim]")
+        elif not health.passed and not regressed and cycle_type.name not in non_code_cycles:
+            console.print(
+                "  [yellow]Health check failed but no regression from baseline "
+                "— keeping changes.[/yellow]"
+            )
+
+        # If a heal cycle passed health, promote baseline to healthy
+        if cycle_type.name == "heal" and health.passed:
+            baseline_healthy = True
+            baseline_health = health
+            console.print("  [green]Project healed! Resuming normal cycles.[/green]")
 
         # Reset session on failure so next cycle gets a fresh full prompt
         if outcome == "failed" and state.claude_session_id:
@@ -826,7 +878,7 @@ def main():
     parser.add_argument("--project", "-p", default=".")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--cycle-type", choices=["planning", "quick_fix", "deep_work", "review", "replan"],
+    parser.add_argument("--cycle-type", choices=["planning", "quick_fix", "deep_work", "review", "replan", "heal"],
                         default=None, help="Force a specific cycle type for all cycles")
     parser.add_argument("--no-rollback", action="store_true",
                         help="Disable automatic rollback on health check failure")

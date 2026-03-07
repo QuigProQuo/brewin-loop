@@ -101,6 +101,23 @@ def detect_build_command(root: str = ".") -> str | None:
     return None
 
 
+def health_regressed(baseline: HealthCheckResult, current: HealthCheckResult) -> bool:
+    """Return True if current health is worse than baseline.
+
+    Rules:
+    - If baseline was already broken and current is still broken (same or better), no regression.
+    - If baseline passed and current fails, that's a regression.
+    - If baseline had no check configured, any failure is a regression.
+    """
+    # Build regression
+    if baseline.build_ok is not False and current.build_ok is False:
+        return True
+    # Test regression
+    if baseline.tests_ok is not False and current.tests_ok is False:
+        return True
+    return False
+
+
 def run_health_check(
     build_cmd: str | None = None,
     test_cmd: str | None = None,
