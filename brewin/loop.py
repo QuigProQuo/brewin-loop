@@ -38,6 +38,42 @@ console = Console()
 
 
 # ---------------------------------------------------------------------------
+# Micro-replan prompt (runs after each work cycle)
+# ---------------------------------------------------------------------------
+
+MICRO_REPLAN_PROMPT = """\
+You just completed a development cycle. Review what happened and update the task backlog.
+
+## What Just Happened
+Cycle focus: {focus}
+Cycle outcome: {outcome}
+Cycle summary: {summary}
+
+## Current Tasks
+{tasks}
+
+## Current Memory
+{memory}
+
+## Your Job (Be Quick)
+
+1. If the completed task isn't marked `[x]` yet, mark it done.
+2. If you partially completed something, update its status note.
+3. If the next priority task is complex, add 2-4 subtasks beneath it.
+4. If you discovered blockers, add `(BLOCKED: reason)` to affected tasks.
+5. Add any discovered issues under `## Discovered`.
+6. Update `.brewin/memory.md` with what you learned this cycle.
+
+Do NOT write application code. Only update `.brewin/tasks.md` and `.brewin/memory.md`.
+
+End with:
+```json
+{{"cycle_focus": "micro-replan", "cycle_outcome": "success", "cycle_summary": "<what you updated>"}}
+```
+"""
+
+
+# ---------------------------------------------------------------------------
 # System prompt
 # ---------------------------------------------------------------------------
 
@@ -81,12 +117,42 @@ The format is simple:
 
 When you COMPLETE a task, mark it done by changing `- [ ]` to `- [x]`.
 When you PARTIALLY complete a task, add a note: `- [ ] Task name (IN PROGRESS: details)`
-Do NOT remove tasks or reorder the user's tasks.
+Do NOT remove tasks or reorder the user's priority tasks.
 
-After completing a task, ADD exactly 1 new suggested task to the bottom of the
-file under a `## Suggested` heading. This task should be something that builds
-on what you just shipped — a natural next step enabled by the new feature.
-Format: `- [ ] description`
+### Task Management (Do This Every Cycle)
+
+After completing or making progress on a task, update `.brewin/tasks.md`:
+
+1. **Break down upcoming work.** If the next unchecked task is complex (multi-file,
+   multi-step), add subtasks indented beneath it:
+   ```
+   - [ ] Build HealthKit importer
+     - [ ] Generalize HealthKitGlucosePoller pattern
+     - [ ] Add body composition import
+     - [ ] Add workout import
+     - [ ] Deduplication by (timestamp, source)
+   ```
+
+2. **Flag blockers.** If you discover something that blocks a future task, add a
+   note directly on the task:
+   ```
+   - [ ] Add body composition import (BLOCKED: needs HealthKit entitlement for HKBodyFatPercentage)
+   ```
+
+3. **Suggest next steps.** Add 1-2 suggested tasks under `## Suggested` that build
+   on what you just shipped — natural next steps enabled by the new work.
+   Format: `- [ ] description`
+
+4. **Note discoveries.** If you find technical debt, missing tests, or architecture
+   issues while working, add them under `## Discovered`:
+   ```
+   ## Discovered
+   - [ ] HealthKitManager.swift has no error handling for denied permissions
+   - [ ] DatabaseMigrations.swift needs index on timestamp columns
+   ```
+
+Do NOT remove or reorder the user's priority tasks. Your additions go in
+`## Suggested` and `## Discovered` sections at the bottom.
 
 If the tasks file is empty or all tasks are checked off, use your own judgment
 based on Mission.md and memory. Pick something high-impact and keep building.
@@ -137,6 +203,40 @@ def _read_file_safe(path: str) -> str | None:
         with open(path) as f:
             return f.read()
     return None
+
+
+def _run_micro_replan(
+    state: BrewinState, config: BrewinConfig,
+    focus: str, outcome: str, summary: str,
+) -> CycleResult | None:
+    """Run a quick, cheap replan call to update tasks and memory after a work cycle."""
+    tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md")) or "(empty)"
+    memory = _read_file_safe(os.path.join(config.state_dir, "memory.md")) or "(empty)"
+
+    prompt = MICRO_REPLAN_PROMPT.format(
+        focus=focus, outcome=outcome, summary=summary,
+        tasks=tasks, memory=memory,
+    )
+
+    console.print("  [dim]Running micro-replan...[/dim]")
+    result = run_cycle(
+        user_message=prompt,
+        system_prompt=(
+            "You are Brewin's task planner. You update task backlogs and memory files. "
+            "You do NOT write application code. Be concise and fast."
+        ),
+        model=config.replan_model or config.model,
+        session_id=state.claude_session_id if state.claude_session_id else None,
+        continue_session=bool(state.claude_session_id),
+        timeout=120,
+    )
+
+    if result.is_error:
+        console.print("  [yellow]Micro-replan failed (non-critical, continuing)[/yellow]")
+        return None
+
+    console.print("  [dim]Micro-replan complete.[/dim]")
+    return result
 
 
 def _build_system_prompt(state: BrewinState, config: BrewinConfig,
@@ -520,6 +620,20 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         hook_env.update({"BREWIN_OUTCOME": outcome, "BREWIN_FOCUS": focus})
         run_hooks(config.post_cycle_hooks, "post-cycle", env_extras=hook_env)
 
+        # Micro-replan: quick task update after work cycles (not after replan/planning)
+        if (config.micro_replan
+                and cycle_type.name in ("deep_work", "quick_fix")
+                and outcome != "failed"
+                and not wrapping_up):
+            replan_result = _run_micro_replan(
+                state, config, focus, outcome, summary,
+            )
+            if replan_result:
+                state.total_input_tokens += replan_result.input_tokens
+                state.total_output_tokens += replan_result.output_tokens
+                state.total_cost_usd += replan_result.cost_usd
+                mgr.save(state)
+
         time.sleep(config.sleep_between_cycles)
 
     # Session complete
@@ -638,10 +752,14 @@ def main():
     parser.add_argument("--project", "-p", default=".")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--cycle-type", choices=["planning", "quick_fix", "deep_work", "review"],
+    parser.add_argument("--cycle-type", choices=["planning", "quick_fix", "deep_work", "review", "replan"],
                         default=None, help="Force a specific cycle type for all cycles")
     parser.add_argument("--no-rollback", action="store_true",
                         help="Disable automatic rollback on health check failure")
+    parser.add_argument("--no-replan", action="store_true",
+                        help="Disable micro-replan after each cycle")
+    parser.add_argument("--replan-interval", type=int, default=None,
+                        help="Insert full replan cycle every N work cycles (0=disabled)")
 
     args = parser.parse_args()
 
@@ -651,8 +769,13 @@ def main():
         model=args.model,
         cycle_type_override=args.cycle_type,
     )
+
     if args.no_rollback:
         config.rollback_on_failure = False
+    if args.no_replan:
+        config.micro_replan = False
+    if args.replan_interval is not None:
+        config.replan_interval = args.replan_interval
 
     if args.project != ".":
         os.chdir(args.project)

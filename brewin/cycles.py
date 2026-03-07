@@ -54,6 +54,25 @@ CYCLE_TYPES: dict[str, CycleType] = {
             "in .brewin/tasks.md."
         ),
     ),
+    "replan": CycleType(
+        name="replan",
+        timeout=300,
+        prompt_addendum=(
+            "## CYCLE MODE: REPLAN\n"
+            "This is a replanning cycle. Do NOT write application code.\n\n"
+            "Your job:\n"
+            "1. Read `.brewin/tasks.md`, `.brewin/memory.md`, and recent git history.\n"
+            "2. Assess what's been accomplished vs what remains.\n"
+            "3. Break down the next 2-3 priority tasks into concrete subtasks.\n"
+            "4. Flag any blockers or dependencies you've discovered.\n"
+            "5. Reprioritize `## Suggested` and `## Discovered` items if needed.\n"
+            "6. Update `.brewin/memory.md` with current project state and priorities.\n"
+            "7. If tasks are vague, make them specific and actionable.\n\n"
+            "Keep the user's original priority order but enrich their tasks with "
+            "subtask breakdowns. Move completed suggestions into the main task list "
+            "if they're high-value."
+        ),
+    ),
 }
 
 
@@ -62,8 +81,14 @@ def select_cycle_type(
     last_outcome: str | None,
     wrapping_up: bool,
     override: str | None = None,
+    replan_interval: int = 0,
 ) -> CycleType:
-    """Auto-select the appropriate cycle type based on context."""
+    """Auto-select the appropriate cycle type based on context.
+
+    Args:
+        replan_interval: If > 0, insert a replan cycle every N work cycles.
+            E.g., replan_interval=4 means cycles 5, 9, 13... are replan cycles.
+    """
     if override and override in CYCLE_TYPES:
         return CYCLE_TYPES[override]
 
@@ -75,5 +100,12 @@ def select_cycle_type(
 
     if cycle == 1:
         return CYCLE_TYPES["planning"]
+
+    # Periodic replan: after every N work cycles (cycle 2 is first work cycle)
+    if replan_interval > 0 and cycle > 2:
+        # Work cycles start at 2 (cycle 1 is planning)
+        work_cycle = cycle - 1
+        if work_cycle % replan_interval == 0:
+            return CYCLE_TYPES["replan"]
 
     return CYCLE_TYPES["deep_work"]

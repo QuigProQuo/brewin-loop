@@ -41,6 +41,11 @@ class BrewinConfig:
     # Cycle types
     cycle_type_override: str | None = None  # Force a specific cycle type
 
+    # Replanning
+    micro_replan: bool = True  # Run a quick task-update call after each work cycle
+    replan_interval: int = 4  # Insert a full replan cycle every N work cycles (0 = disabled)
+    replan_model: str | None = None  # Model for micro-replan (defaults to main model)
+
     # Hooks
     pre_cycle_hooks: list[str] = field(default_factory=list)
     post_cycle_hooks: list[str] = field(default_factory=list)
@@ -60,10 +65,14 @@ def detect_project_type(root: str = ".") -> str:
         "go.mod": "go",
         "Cargo.toml": "rust",
         "Gemfile": "ruby",
+        "Package.swift": "swift",
     }
     for marker, lang in markers.items():
         if (root / marker).exists():
             return lang
+    # Check for .xcodeproj directories (Swift/iOS projects without Package.swift)
+    if any(p.suffix == ".xcodeproj" for p in root.iterdir() if p.is_dir()):
+        return "swift"
     return "unknown"
 
 
@@ -111,6 +120,15 @@ def load_config(**overrides) -> BrewinConfig:
 
     if "cycle_type" in toml_data:
         config.cycle_type_override = toml_data["cycle_type"]
+
+    if "replan" in toml_data:
+        replan = toml_data["replan"]
+        if "micro_replan" in replan:
+            config.micro_replan = bool(replan["micro_replan"])
+        if "interval" in replan:
+            config.replan_interval = int(replan["interval"])
+        if "model" in replan:
+            config.replan_model = replan["model"]
 
     # Apply env vars (override TOML)
     env_map = {
