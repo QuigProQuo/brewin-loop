@@ -3,7 +3,8 @@ Brewin Loop configuration.
 """
 
 import os
-from dataclasses import dataclass
+import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -31,6 +32,23 @@ class BrewinConfig:
     # Wrap-up: when fewer than this many minutes remain, tell Claude to wrap up
     wrap_up_minutes: int = 5
 
+    # Health checks
+    health_check_build: str | None = None
+    health_check_test: str | None = None
+    health_check_timeout: int = 120
+    rollback_on_failure: bool = True
+
+    # Cycle types
+    cycle_type_override: str | None = None  # Force a specific cycle type
+
+    # Hooks
+    pre_cycle_hooks: list[str] = field(default_factory=list)
+    post_cycle_hooks: list[str] = field(default_factory=list)
+    post_session_hooks: list[str] = field(default_factory=list)
+
+    # Prompt limits
+    max_prompt_chars: int = 15000
+
 
 def detect_project_type(root: str = ".") -> str:
     root = Path(root)
@@ -49,9 +67,52 @@ def detect_project_type(root: str = ".") -> str:
     return "unknown"
 
 
+def _load_toml_config(state_dir: str = ".brewin") -> dict:
+    """Load .brewin/config.toml if it exists."""
+    config_path = Path(state_dir) / "config.toml"
+    if not config_path.exists():
+        return {}
+    try:
+        with open(config_path, "rb") as f:
+            return tomllib.load(f)
+    except Exception:
+        return {}
+
+
 def load_config(**overrides) -> BrewinConfig:
     config = BrewinConfig()
 
+    # Load from .brewin/config.toml
+    toml_data = _load_toml_config(config.state_dir)
+
+    # Apply TOML settings
+    if "health" in toml_data:
+        health = toml_data["health"]
+        if "build" in health:
+            config.health_check_build = health["build"]
+        if "test" in health:
+            config.health_check_test = health["test"]
+        if "timeout" in health:
+            config.health_check_timeout = int(health["timeout"])
+        if "rollback_on_failure" in health:
+            config.rollback_on_failure = bool(health["rollback_on_failure"])
+
+    if "hooks" in toml_data:
+        hooks = toml_data["hooks"]
+        if "pre_cycle" in hooks:
+            config.pre_cycle_hooks = list(hooks["pre_cycle"])
+        if "post_cycle" in hooks:
+            config.post_cycle_hooks = list(hooks["post_cycle"])
+        if "post_session" in hooks:
+            config.post_session_hooks = list(hooks["post_session"])
+
+    if "model" in toml_data:
+        config.model = toml_data["model"]
+
+    if "cycle_type" in toml_data:
+        config.cycle_type_override = toml_data["cycle_type"]
+
+    # Apply env vars (override TOML)
     env_map = {
         "BREWIN_MODEL": "model",
         "BREWIN_TIME": "time_budget_minutes",
@@ -66,6 +127,7 @@ def load_config(**overrides) -> BrewinConfig:
                 val = int(val)
             setattr(config, attr, val)
 
+    # Apply CLI overrides (highest priority)
     for key, val in overrides.items():
         if hasattr(config, key) and val is not None:
             setattr(config, key, val)

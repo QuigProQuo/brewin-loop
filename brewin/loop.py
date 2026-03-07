@@ -13,10 +13,12 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 from rich.console import Console
@@ -25,7 +27,12 @@ from rich.table import Table
 
 from brewin.config import BrewinConfig, load_config, detect_project_type
 from brewin.state import BrewinState, StateManager
-from brewin.agent import run_cycle
+from brewin.agent import run_cycle, CycleResult
+from brewin.checkpoint import create_checkpoint, rollback_to_checkpoint, cleanup_checkpoints
+from brewin.healthcheck import run_health_check
+from brewin.context import get_git_context, get_project_tree, get_health_summary
+from brewin.cycles import select_cycle_type
+from brewin.hooks import run_hooks, build_hook_env
 
 console = Console()
 
@@ -61,7 +68,7 @@ You have agency:
   - NEVER ignore Mission.md. Every decision must serve the project's purpose.
   - ALWAYS commit your work before ending the cycle.
   - ALWAYS update .brewin/memory.md before ending the cycle (see MEMORY below).
-  - ALWAYS end your response with the CYCLE tags (see below).
+  - ALWAYS end your response with the CYCLE JSON block (see below).
 
 ## TASKS
 
@@ -103,14 +110,18 @@ When you start a new session, this is how you'll know where you left off.
 
 ## ENDING A CYCLE
 
-When you're done with this cycle, your LAST lines MUST be exactly:
+When you're done with this cycle, your LAST lines MUST be a JSON block:
 
-CYCLE_FOCUS: <one-line description of what you worked on>
-CYCLE_OUTCOME: <success|moved_on|wrapped_up|failed>
-CYCLE_SUMMARY: <2-3 sentence summary of what you built/changed>
+```json
+{"cycle_focus": "<one-line description>", "cycle_outcome": "<success|moved_on|wrapped_up|failed>", "cycle_summary": "<2-3 sentence summary>"}
+```
 
-These tags are how the outer loop tracks your progress. Do NOT omit them.
-Do NOT put them in markdown formatting. They must be plain text on their own lines.
+These fields are how the outer loop tracks your progress. Do NOT omit them.
+
+Fallback: If you cannot output JSON, use these plain-text tags on their own lines:
+CYCLE_FOCUS: <description>
+CYCLE_OUTCOME: <outcome>
+CYCLE_SUMMARY: <summary>
 
 ## DECISION PRINCIPLES
 
@@ -130,10 +141,16 @@ def _read_file_safe(path: str) -> str | None:
 
 def _build_system_prompt(state: BrewinState, config: BrewinConfig,
                          initial_direction: str | None = None,
-                         wrapping_up: bool = False) -> str:
-    """Build the full system prompt for a cycle."""
+                         wrapping_up: bool = False,
+                         cycle_type_addendum: str = "",
+                         health_context: str = "") -> str:
+    """Build the full system prompt for cycle 1."""
     prompt = BREWIN_SYSTEM_PROMPT
     sections = []
+
+    # Cycle type mode
+    if cycle_type_addendum:
+        sections.append(cycle_type_addendum)
 
     # Mission
     mission = _read_file_safe(config.mission_file)
@@ -169,6 +186,21 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
             "of this cycle to record what you learned."
         )
 
+    # Git context
+    git_ctx = get_git_context()
+    if git_ctx:
+        sections.append(f"## Recent Git Activity\n{git_ctx}")
+
+    # Project structure (only on first cycle to save tokens)
+    if state.cycle_count == 0:
+        tree = get_project_tree()
+        if tree:
+            sections.append(f"## Project Structure\n```\n{tree}\n```")
+
+    # Health check results from previous cycle
+    if health_context:
+        sections.append(f"## Project Health\n{health_context}")
+
     # Time
     remaining = state.format_time_remaining(config.time_budget_minutes)
     sections.append(f"## Time Remaining\n{remaining} left in this session.")
@@ -191,7 +223,74 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
             "Commit any uncommitted work, push, and end the cycle cleanly."
         )
 
-    return prompt + "\n\n" + "\n\n".join(sections)
+    full_prompt = prompt + "\n\n" + "\n\n".join(sections)
+
+    # Dynamic prompt sizing — truncate if too long
+    if len(full_prompt) > config.max_prompt_chars:
+        # Rebuild without project tree and truncate history
+        sections = [s for s in sections if not s.startswith("## Project Structure")]
+        full_prompt = prompt + "\n\n" + "\n\n".join(sections)
+
+    return full_prompt
+
+
+def _build_continuation_prompt(state: BrewinState, config: BrewinConfig,
+                                wrapping_up: bool = False) -> str:
+    """Build a lightweight prompt for cycles 2+ (session already has full context)."""
+    remaining = state.format_time_remaining(config.time_budget_minutes)
+    parts = [
+        f"Continue. {remaining} remaining in this session. "
+        f"Starting cycle {state.cycle_count + 1}.",
+    ]
+
+    if wrapping_up:
+        parts.append(
+            "TIME IS ALMOST UP. Commit all work, update memory, and wrap up."
+        )
+
+    # Include fresh tasks in case user updated them between cycles
+    tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md"))
+    if tasks:
+        parts.append(f"\nCurrent tasks (.brewin/tasks.md):\n{tasks}")
+
+    # Include fresh memory in case it was updated
+    memory = _read_file_safe(os.path.join(config.state_dir, "memory.md"))
+    if memory:
+        parts.append(f"\nMemory (.brewin/memory.md):\n{memory}")
+
+    return "\n\n".join(parts)
+
+
+def _parse_cycle_result(text: str) -> dict:
+    """Extract structured cycle result from output. Tries JSON block first,
+    falls back to tag parsing."""
+    # Try JSON block
+    json_match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(1))
+            if all(k in data for k in ("cycle_focus", "cycle_outcome", "cycle_summary")):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+    # Try bare JSON on last lines
+    for line in reversed(text.splitlines()):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                data = json.loads(line)
+                if "cycle_focus" in data:
+                    return data
+            except json.JSONDecodeError:
+                continue
+
+    # Fallback: tag parsing (backward compat)
+    return {
+        "cycle_focus": _parse_tag(text, "CYCLE_FOCUS") or "Unknown",
+        "cycle_outcome": _parse_tag(text, "CYCLE_OUTCOME") or "completed",
+        "cycle_summary": _parse_tag(text, "CYCLE_SUMMARY") or "",
+    }
 
 
 def _parse_tag(text: str, tag: str) -> str:
@@ -223,7 +322,8 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         console.print(Panel(
             f"[bold]Resuming Brewin[/bold]\n"
             f"  Cycles done: [cyan]{state.cycle_count}[/cyan]\n"
-            f"  New budget:  [cyan]{config.time_budget_minutes}m[/cyan]",
+            f"  New budget:  [cyan]{config.time_budget_minutes}m[/cyan]\n"
+            f"  Session:     [dim]{state.claude_session_id[:12]}...[/dim]",
             border_style="yellow",
         ))
     else:
@@ -231,6 +331,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         state.start_time = time.time()
         state.project_root = os.getcwd()
         state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        state.claude_session_id = str(uuid.uuid4())
 
     project_type = detect_project_type()
 
@@ -240,13 +341,16 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             f"  Time budget:  [cyan]{config.time_budget_minutes}m[/cyan]\n"
             f"  Project:      [cyan]{project_type}[/cyan]\n"
             f"  Model:        [cyan]{config.model}[/cyan]\n"
-            f"  Mode:         [cyan]{config.autonomy_mode}[/cyan]"
+            f"  Mode:         [cyan]{config.autonomy_mode}[/cyan]\n"
+            f"  Session:      [dim]{state.claude_session_id[:12]}...[/dim]"
             + (f"\n  Direction:    [green]{initial_direction}[/green]"
                if initial_direction else ""),
             border_style="bold blue",
         ))
 
     cycle = state.cycle_count
+    last_outcome: str | None = None
+    last_health_context = ""
 
     while not state.is_time_up(config.time_budget_minutes):
         cycle += 1
@@ -259,8 +363,18 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         wrapping_up = state.is_wrapping_up(
             config.time_budget_minutes, config.wrap_up_minutes
         )
+
+        # Select cycle type
+        cycle_type = select_cycle_type(
+            cycle, last_outcome, wrapping_up,
+            override=config.cycle_type_override,
+        )
+
         remaining = state.format_time_remaining(config.time_budget_minutes)
-        label = f"[bold]Cycle {cycle}[/bold] — {remaining} remaining"
+        label = (
+            f"[bold]Cycle {cycle}[/bold] [{cycle_type.name}] — "
+            f"{remaining} remaining"
+        )
         if wrapping_up:
             label += " [yellow](WRAP-UP)[/yellow]"
         console.print(Panel(label, border_style="yellow" if wrapping_up else "cyan"))
@@ -278,37 +392,133 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                 console.print("\nHalted.")
                 break
 
+        # Pre-cycle hooks
+        hook_env = build_hook_env(
+            cycle=cycle, session_id=state.session_id,
+            time_remaining=remaining,
+        )
+        run_hooks(config.pre_cycle_hooks, "pre-cycle", env_extras=hook_env)
+
+        # Git checkpoint
+        checkpoint = create_checkpoint(cycle, state.session_id)
+
         # Build prompt and run cycle
+        # Always send system prompt (safety net if session continuity fails).
+        # Cycle 1: full prompt + direction. Cycles 2+: try session continuity
+        # with a continuation user message.
+        is_first_cycle = (cycle == 1) or not state.claude_session_id
+        use_session_continuity = not is_first_cycle
+
+        # Always build system prompt — session continuity may not work in -p mode
         system_prompt = _build_system_prompt(
             state, config,
-            initial_direction=initial_direction if cycle == 1 else None,
+            initial_direction=initial_direction if is_first_cycle else None,
             wrapping_up=wrapping_up,
+            cycle_type_addendum=cycle_type.prompt_addendum,
+            health_context=last_health_context,
         )
 
-        output = run_cycle(
-            user_message="Start a new development cycle. What's next?",
+        if is_first_cycle:
+            user_message = "Start a new development cycle. What's next?"
+        else:
+            user_message = _build_continuation_prompt(
+                state, config, wrapping_up=wrapping_up,
+            )
+            # Prepend cycle type instructions to continuation prompt
+            if cycle_type.prompt_addendum:
+                user_message = cycle_type.prompt_addendum + "\n\n" + user_message
+            # Include health context if available
+            if last_health_context:
+                user_message += f"\n\n## Project Health\n{last_health_context}"
+
+        cycle_result = run_cycle(
+            user_message=user_message,
             system_prompt=system_prompt,
             model=config.model,
+            session_id=state.claude_session_id if use_session_continuity else None,
+            continue_session=use_session_continuity,
+            timeout=cycle_type.timeout,
         )
+
+        # Update session ID from Claude's response (in case it changed)
+        if cycle_result.session_id:
+            state.claude_session_id = cycle_result.session_id
 
         # Parse cycle results from output
         cycle_duration = time.time() - cycle_start
-        focus = _parse_tag(output, "CYCLE_FOCUS") or "Unknown"
-        outcome = _parse_tag(output, "CYCLE_OUTCOME") or "completed"
-        summary = _parse_tag(output, "CYCLE_SUMMARY") or ""
+        parsed = _parse_cycle_result(cycle_result.output)
+        focus = parsed.get("cycle_focus", "Unknown")
+        outcome = parsed.get("cycle_outcome", "completed")
+        summary = parsed.get("cycle_summary", "")
 
-        state.log_cycle(focus, outcome, summary=summary, duration=cycle_duration)
+        # Override outcome if the cycle was killed/errored
+        if cycle_result.is_error and outcome not in ("failed",):
+            outcome = "failed"
+            if not summary:
+                summary = "Cycle terminated abnormally"
+
+        # Independent health check
+        health = run_health_check(
+            build_cmd=config.health_check_build,
+            test_cmd=config.health_check_test,
+            timeout=config.health_check_timeout,
+        )
+
+        # Build health context for next cycle's prompt
+        last_health_context = get_health_summary(
+            health.build_ok, health.tests_ok, health.test_output,
+        )
+
+        # Rollback on verified failure
+        if not health.passed and config.rollback_on_failure and checkpoint.success:
+            console.print(
+                f"[red]Health check failed after cycle {cycle}. "
+                f"Rolling back to {checkpoint.tag}[/red]"
+            )
+            rollback_to_checkpoint(checkpoint.tag)
+            outcome = "failed"
+            summary += " (rolled back — health check failed)"
+            # Reset Claude session — its context is now stale after rollback
+            state.claude_session_id = ""
+            console.print("  [dim]Session reset (rollback invalidated context)[/dim]")
+
+        last_outcome = outcome
+
+        state.log_cycle(
+            focus, outcome,
+            summary=summary,
+            duration=cycle_duration,
+            input_tokens=cycle_result.input_tokens,
+            output_tokens=cycle_result.output_tokens,
+            cost_usd=cycle_result.cost_usd,
+        )
         mgr.save(state)
 
         style = "green" if outcome == "success" else "yellow"
+        if outcome == "failed":
+            style = "red"
+        tokens_str = f"{cycle_result.input_tokens:,}in / {cycle_result.output_tokens:,}out"
+        health_str = ""
+        if health.build_ok is not None or health.tests_ok is not None:
+            health_str = (
+                f"\n  Health:   build={'pass' if health.build_ok else 'FAIL' if health.build_ok is not None else 'n/a'}"
+                f" tests={'pass' if health.tests_ok else 'FAIL' if health.tests_ok is not None else 'n/a'}"
+            )
         console.print(Panel(
-            f"[bold]Cycle {cycle} done[/bold]\n"
+            f"[bold]Cycle {cycle} done[/bold] [{cycle_type.name}]\n"
             f"  Focus:    {focus}\n"
             f"  Outcome:  {outcome}\n"
             f"  Summary:  {summary}\n"
-            f"  Duration: {cycle_duration:.0f}s",
+            f"  Duration: {cycle_duration:.0f}s\n"
+            f"  Tokens:   {tokens_str}\n"
+            f"  Cost:     ${cycle_result.cost_usd:.4f}"
+            + health_str,
             border_style=style,
         ))
+
+        # Post-cycle hooks
+        hook_env.update({"BREWIN_OUTCOME": outcome, "BREWIN_FOCUS": focus})
+        run_hooks(config.post_cycle_hooks, "post-cycle", env_extras=hook_env)
 
         time.sleep(config.sleep_between_cycles)
 
@@ -317,6 +527,17 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
     _save_session_log(state, config)
     mgr.save(state)
 
+    # Post-session hooks
+    run_hooks(config.post_session_hooks, "post-session", env_extras=build_hook_env(
+        cycle=state.cycle_count, session_id=state.session_id,
+        outcome=last_outcome or "",
+    ))
+
+    # Cleanup checkpoints on successful sessions
+    failed_count = sum(1 for e in state.cycle_log if e["outcome"] == "failed")
+    if failed_count == 0:
+        cleanup_checkpoints(state.session_id)
+
 
 def print_summary(state: BrewinState, config: BrewinConfig):
     table = Table(title="Brewin Session Summary", border_style="blue")
@@ -324,14 +545,21 @@ def print_summary(state: BrewinState, config: BrewinConfig):
     table.add_column("Focus", style="white")
     table.add_column("Outcome")
     table.add_column("Duration", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("Cost", justify="right")
 
     for entry in state.cycle_log:
         style = "green" if entry["outcome"] == "success" else "red"
+        in_tok = entry.get("input_tokens", 0)
+        out_tok = entry.get("output_tokens", 0)
+        cost = entry.get("cost_usd", 0.0)
         table.add_row(
             str(entry["cycle"]),
             entry["focus"],
             f"[{style}]{entry['outcome']}[/{style}]",
             f"{entry.get('duration_seconds', 0):.0f}s",
+            f"{in_tok:,}/{out_tok:,}",
+            f"${cost:.4f}",
         )
 
     console.print()
@@ -341,7 +569,9 @@ def print_summary(state: BrewinState, config: BrewinConfig):
     console.print(Panel(
         f"  Cycles: {state.cycle_count}  |  "
         f"Successful: {successful}  |  "
-        f"Time: {state.elapsed_minutes():.0f}m / {config.time_budget_minutes}m",
+        f"Time: {state.elapsed_minutes():.0f}m / {config.time_budget_minutes}m  |  "
+        f"Tokens: {state.total_input_tokens:,}in / {state.total_output_tokens:,}out  |  "
+        f"Cost: ${state.total_cost_usd:.4f}",
         border_style="bold blue",
     ))
 
@@ -359,6 +589,8 @@ def _save_session_log(state: BrewinState, config: BrewinConfig):
         f"- Duration: {state.elapsed_minutes():.0f}m / {config.time_budget_minutes}m budget",
         f"- Model: {config.model}",
         f"- Cycles: {state.cycle_count}",
+        f"- Tokens: {state.total_input_tokens:,} in / {state.total_output_tokens:,} out",
+        f"- Cost: ${state.total_cost_usd:.4f}",
         f"",
         f"## Cycles",
         f"",
@@ -368,6 +600,7 @@ def _save_session_log(state: BrewinState, config: BrewinConfig):
         lines.append(f"### {status} Cycle {e['cycle']}: {e['focus']}")
         lines.append(f"- Outcome: {e['outcome']}")
         lines.append(f"- Duration: {e.get('duration_seconds', 0):.0f}s")
+        lines.append(f"- Tokens: {e.get('input_tokens', 0):,}in / {e.get('output_tokens', 0):,}out")
         if e.get("summary"):
             lines.append(f"- Summary: {e['summary']}")
         lines.append("")
@@ -386,7 +619,9 @@ def show_status(config: BrewinConfig):
     console.print(Panel(
         f"  Session: {state.session_id}\n"
         f"  Cycles:  {state.cycle_count}\n"
-        f"  Project: {state.project_root}",
+        f"  Project: {state.project_root}\n"
+        f"  Tokens:  {state.total_input_tokens:,}in / {state.total_output_tokens:,}out\n"
+        f"  Cost:    ${state.total_cost_usd:.4f}",
         title="Brewin Status",
         border_style="blue",
     ))
@@ -403,6 +638,10 @@ def main():
     parser.add_argument("--project", "-p", default=".")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--cycle-type", choices=["planning", "quick_fix", "deep_work", "review"],
+                        default=None, help="Force a specific cycle type for all cycles")
+    parser.add_argument("--no-rollback", action="store_true",
+                        help="Disable automatic rollback on health check failure")
 
     args = parser.parse_args()
 
@@ -410,7 +649,10 @@ def main():
         time_budget_minutes=args.time,
         autonomy_mode=args.mode,
         model=args.model,
+        cycle_type_override=args.cycle_type,
     )
+    if args.no_rollback:
+        config.rollback_on_failure = False
 
     if args.project != ".":
         os.chdir(args.project)

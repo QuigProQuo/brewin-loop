@@ -12,10 +12,14 @@ from pathlib import Path
 @dataclass
 class BrewinState:
     session_id: str = ""
+    claude_session_id: str = ""  # Claude CLI session UUID for continuity
     project_root: str = ""
     start_time: float = 0.0
     cycle_count: int = 0
     cycle_log: list[dict] = field(default_factory=list)
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cost_usd: float = 0.0
 
     def elapsed_minutes(self) -> float:
         if self.start_time == 0:
@@ -32,14 +36,21 @@ class BrewinState:
         return self.time_remaining_minutes(budget) < wrap_up
 
     def log_cycle(self, focus: str, outcome: str, summary: str = "",
-                  duration: float = 0.0):
+                  duration: float = 0.0, input_tokens: int = 0,
+                  output_tokens: int = 0, cost_usd: float = 0.0):
         self.cycle_count += 1
+        self.total_input_tokens += input_tokens
+        self.total_output_tokens += output_tokens
+        self.total_cost_usd += cost_usd
         self.cycle_log.append({
             "cycle": self.cycle_count,
             "focus": focus,
             "outcome": outcome,
             "summary": summary,
             "duration_seconds": duration,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cost_usd": cost_usd,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         })
 
@@ -49,7 +60,8 @@ class BrewinState:
         lines = []
         for e in self.cycle_log[-10:]:
             status = "+" if e["outcome"] == "success" else "x"
-            line = f"  {status} Cycle {e['cycle']}: {e['focus']} ({e['outcome']})"
+            tokens = f"{e.get('input_tokens', 0):,}in/{e.get('output_tokens', 0):,}out"
+            line = f"  {status} Cycle {e['cycle']}: {e['focus']} ({e['outcome']}) [{tokens}]"
             if e.get("summary"):
                 line += f"\n    {e['summary']}"
             lines.append(line)
