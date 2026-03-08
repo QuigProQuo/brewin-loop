@@ -144,6 +144,8 @@ def run_health_check(
     auto_detect: bool = True,
 ) -> HealthCheckResult:
     """Run build and test commands, return independent health check result."""
+    if timeout <= 0:
+        timeout = 120
     root = cwd or "."
 
     if auto_detect:

@@ -3,6 +3,8 @@ Brewin state manager. Persisted to .brewin/state.json.
 """
 
 import json
+import os
+import tempfile
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
@@ -94,8 +96,22 @@ class StateManager:
 
     def save(self, state: BrewinState):
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.state_file, "w", encoding="utf-8") as f:
-            json.dump(asdict(state), f, indent=2)
+        # Atomic write: write to temp file then rename, so a crash mid-write
+        # can't leave a truncated/corrupt state.json
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.state_dir), suffix=".tmp", prefix="state-"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(asdict(state), f, indent=2)
+            os.replace(tmp_path, str(self.state_file))
+        except BaseException:
+            # Clean up temp file on any failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def reset(self) -> BrewinState:
         state = BrewinState()

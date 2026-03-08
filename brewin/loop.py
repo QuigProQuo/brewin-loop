@@ -346,8 +346,13 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
 
     # Dynamic prompt sizing — truncate if too long
     if len(full_prompt) > config.max_prompt_chars:
-        # Rebuild without project tree and truncate history
+        had_tree = any(s.startswith("## Project Structure") for s in sections)
         sections = [s for s in sections if not s.startswith("## Project Structure")]
+        if had_tree:
+            sections.append(
+                "## Note\nProject structure was omitted to fit prompt size limits. "
+                "Use `find . -type f` or `ls -R` if you need to explore the file tree."
+            )
         full_prompt = prompt + "\n\n" + "\n\n".join(sections)
 
     return full_prompt
@@ -458,7 +463,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         state = mgr.reset()
         state.start_time = time.time()
         state.project_root = os.getcwd()
-        state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
 
         # Create worktree for agent mode
         if config.agent_name:

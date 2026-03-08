@@ -4,6 +4,7 @@ Runs shell commands before/after cycles and sessions.
 """
 
 import os
+import signal
 import subprocess
 
 from rich.console import Console
@@ -28,21 +29,31 @@ def run_hooks(
         env.update(env_extras)
 
     for cmd in hooks:
+        proc = None
         try:
-            result = subprocess.run(
+            # Run in a new process group so we can kill the entire tree on timeout
+            proc = subprocess.Popen(
                 cmd, shell=True,
-                capture_output=True, text=True,
-                timeout=HOOK_TIMEOUT,
-                cwd=cwd, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, cwd=cwd, env=env,
+                start_new_session=True,
             )
-            if result.returncode != 0:
+            stdout, stderr = proc.communicate(timeout=HOOK_TIMEOUT)
+            if proc.returncode != 0:
                 console.print(
                     f"  [yellow]Hook ({label}) failed: {cmd}[/yellow]\n"
-                    f"    {result.stderr.strip()[:200]}"
+                    f"    {stderr.strip()[:200]}"
                 )
             else:
                 console.print(f"  [dim]Hook ({label}): {cmd} — ok[/dim]")
         except subprocess.TimeoutExpired:
+            # Kill the entire process group, not just the shell
+            if proc:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except OSError:
+                    proc.kill()
+                proc.wait(timeout=5)
             console.print(f"  [yellow]Hook ({label}) timed out: {cmd}[/yellow]")
         except Exception as e:
             console.print(f"  [yellow]Hook ({label}) error: {e}[/yellow]")
