@@ -92,8 +92,6 @@ def run_cycle(
     system_prompt: str | None = None,
     model: str | None = None,
     cwd: str | None = None,
-    session_id: str | None = None,
-    continue_session: bool = False,
     timeout: int | None = None,
 ) -> CycleResult:
     """Run a single Brewin cycle via claude -p with streaming output."""
@@ -111,13 +109,10 @@ def run_cycle(
     if model:
         cmd.extend(["--model", model])
 
-    if session_id and continue_session:
-        # Continuing an existing session — cannot override system prompt,
-        # but can append additional context via --append-system-prompt.
-        cmd.extend(["--session-id", session_id])
-        if system_prompt and system_prompt.strip():
-            cmd.extend(["--append-system-prompt", system_prompt])
-    elif system_prompt and system_prompt.strip():
+    # Always use --system-prompt (never --session-id). Session continuity
+    # in -p mode causes instant crashes, and each cycle already gets full
+    # context via the system prompt (memory, tasks, history, git context).
+    if system_prompt and system_prompt.strip():
         cmd.extend(["--system-prompt", system_prompt])
 
     cmd.append(user_message)

@@ -219,8 +219,6 @@ def _run_micro_replan(
     )
 
     console.print("  [dim]Running micro-replan...[/dim]")
-    # Always use a fresh session — micro-replan has its own system prompt
-    # and continuing the work cycle's session would ignore it.
     result = run_cycle(
         user_message=prompt,
         system_prompt=(
@@ -228,8 +226,6 @@ def _run_micro_replan(
             "You do NOT write application code. Be concise and fast."
         ),
         model=config.replan_model or config.model,
-        session_id=None,
-        continue_session=False,
         timeout=120,
     )
 
@@ -247,7 +243,7 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
                          cycle_type_addendum: str = "",
                          health_context: str = "",
                          timeout_context: str = "") -> str:
-    """Build the full system prompt for cycle 1."""
+    """Build the full system prompt (sent fresh every cycle)."""
     prompt = BREWIN_SYSTEM_PROMPT
     # Replace .brewin/ references with agent-specific paths when in agent mode
     if config.agent_name:
@@ -283,9 +279,10 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
         sections.append(f"## Conventions (from CLAUDE.md)\n{claude_md}")
 
     # Tasks — user-managed backlog
-    tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md"))
+    tasks_path = os.path.join(config.state_dir, "tasks.md")
+    tasks = _read_file_safe(tasks_path)
     if tasks:
-        sections.append(f"## Tasks (from .brewin/tasks.md)\n{tasks}")
+        sections.append(f"## Tasks (from {tasks_path})\n{tasks}")
     else:
         sections.append(
             "## Tasks\nNo task backlog found. Use your own judgment based on "
@@ -293,12 +290,13 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
         )
 
     # Memory — persistent knowledge from previous cycles/sessions
-    memory = _read_file_safe(os.path.join(config.state_dir, "memory.md"))
+    memory_path = os.path.join(config.state_dir, "memory.md")
+    memory = _read_file_safe(memory_path)
     if memory:
-        sections.append(f"## Memory (from .brewin/memory.md)\n{memory}")
+        sections.append(f"## Memory (from {memory_path})\n{memory}")
     else:
         sections.append(
-            "## Memory\nNo memory file yet. Create `.brewin/memory.md` at the end "
+            f"## Memory\nNo memory file yet. Create `{memory_path}` at the end "
             "of this cycle to record what you learned."
         )
 
@@ -356,7 +354,11 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
 
 def _build_continuation_prompt(state: BrewinState, config: BrewinConfig,
                                 wrapping_up: bool = False) -> str:
-    """Build a lightweight prompt for cycles 2+ (session already has full context)."""
+    """Build the user message for cycles 2+.
+
+    Tasks, memory, and cycle type instructions are already in the system
+    prompt (sent fresh every cycle), so this just signals continuation.
+    """
     remaining = state.format_time_remaining(config.time_budget_minutes)
     parts = [
         f"Continue. {remaining} remaining in this session. "
@@ -367,16 +369,6 @@ def _build_continuation_prompt(state: BrewinState, config: BrewinConfig,
         parts.append(
             "TIME IS ALMOST UP. Commit all work, update memory, and wrap up."
         )
-
-    # Include fresh tasks in case user updated them between cycles
-    tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md"))
-    if tasks:
-        parts.append(f"\nCurrent tasks (.brewin/tasks.md):\n{tasks}")
-
-    # Include fresh memory in case it was updated
-    memory = _read_file_safe(os.path.join(config.state_dir, "memory.md"))
-    if memory:
-        parts.append(f"\nMemory (.brewin/memory.md):\n{memory}")
 
     return "\n\n".join(parts)
 
@@ -462,7 +454,6 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         state.start_time = time.time()
         state.project_root = os.getcwd()
         state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        state.claude_session_id = ""
 
         # Create worktree for agent mode
         if config.agent_name:
@@ -541,6 +532,9 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
     last_timeout_context = ""
     consecutive_stalls = 0
     consecutive_failures = 0
+    consecutive_heal_successes_but_health_fails = 0
+    work_cycles_since_test = 0
+    work_cycles_since_cleanup = 0
 
     while not state.is_time_up(config.time_budget_minutes):
         cycle += 1
@@ -558,8 +552,11 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         cycle_type = select_cycle_type(
             cycle, last_outcome, wrapping_up,
             override=config.cycle_type_override,
+            replan_interval=config.replan_interval,
             consecutive_stalls=consecutive_stalls,
             baseline_healthy=baseline_healthy,
+            work_cycles_since_test=work_cycles_since_test,
+            work_cycles_since_cleanup=work_cycles_since_cleanup,
         )
 
         remaining = state.format_time_remaining(config.time_budget_minutes)
@@ -591,15 +588,16 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         )
         run_hooks(config.pre_cycle_hooks, "pre-cycle", env_extras=hook_env)
 
-        # Git checkpoint
-        checkpoint = create_checkpoint(cycle, state.session_id)
+        # Git checkpoint (skip for non-committing cycles)
+        if cycle_type.name == "spike":
+            checkpoint = type('obj', (object,), {'success': False, 'tag': ''})()
+        else:
+            checkpoint = create_checkpoint(cycle, state.session_id)
 
         # Build prompt and run cycle
-        # Always send system prompt (safety net if session continuity fails).
-        # Cycle 1: full prompt + direction. Cycles 2+: try session continuity
-        # with a continuation user message.
-        is_first_cycle = (cycle == 1) or not state.claude_session_id
-        use_session_continuity = not is_first_cycle
+        # Every cycle is a fresh claude -p call with full system prompt.
+        # Session continuity (-p --session-id) causes instant crashes.
+        is_first_cycle = cycle == 1
 
         # For heal cycles, inject baseline failure details as health context
         heal_health_context = last_health_context
@@ -611,7 +609,6 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                 test_cmd=config.health_check_test,
             )
 
-        # Always build system prompt — session continuity may not work in -p mode
         system_prompt = _build_system_prompt(
             state, config,
             initial_direction=initial_direction if is_first_cycle else None,
@@ -621,21 +618,19 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             timeout_context=last_timeout_context,
         )
 
-        if is_first_cycle:
-            if cycle_type.name == "heal":
-                user_message = (
-                    "The project's build/tests are failing. Fix them before "
-                    "starting any feature work."
-                )
-            else:
-                user_message = "Start a new development cycle. What's next?"
+        if cycle_type.name == "heal":
+            user_message = (
+                "The project's build/tests are failing. Fix them before "
+                "starting any feature work."
+            )
+        elif is_first_cycle:
+            user_message = "Start a new development cycle. What's next?"
         else:
             user_message = _build_continuation_prompt(
                 state, config, wrapping_up=wrapping_up,
             )
-            # Prepend cycle type instructions to continuation prompt
-            if cycle_type.prompt_addendum:
-                user_message = cycle_type.prompt_addendum + "\n\n" + user_message
+            # Cycle type instructions are already in the system prompt —
+            # no need to duplicate them in the user message.
             # Include health context if available
             if last_health_context:
                 user_message += f"\n\n## Project Health\n{last_health_context}"
@@ -650,14 +645,8 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             user_message=user_message,
             system_prompt=system_prompt,
             model=config.model,
-            session_id=state.claude_session_id if use_session_continuity else None,
-            continue_session=use_session_continuity,
             timeout=effective_timeout,
         )
-
-        # Update session ID from Claude's response (in case it changed)
-        if cycle_result.session_id:
-            state.claude_session_id = cycle_result.session_id
 
         # Parse cycle results from output
         cycle_duration = time.time() - cycle_start
@@ -682,7 +671,7 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                     summary = "Cycle terminated abnormally"
 
         # Independent health check — skip for non-code cycles
-        non_code_cycles = ("planning", "replan")
+        non_code_cycles = ("planning", "replan", "spike")
         if cycle_type.name in non_code_cycles:
             health = HealthCheckResult(passed=True)
             health.build_ok = None
@@ -715,9 +704,6 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             rollback_to_checkpoint(checkpoint.tag)
             outcome = "failed"
             summary += " (rolled back — health regressed)"
-            # Reset Claude session — its context is now stale after rollback
-            state.claude_session_id = ""
-            console.print("  [dim]Session reset (rollback invalidated context)[/dim]")
         elif not health.passed and not regressed and cycle_type.name not in non_code_cycles:
             console.print(
                 "  [yellow]Health check failed but no regression from baseline "
@@ -728,14 +714,37 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         if cycle_type.name == "heal" and health.passed:
             baseline_healthy = True
             baseline_health = health
+            consecutive_heal_successes_but_health_fails = 0
             console.print("  [green]Project healed! Resuming normal cycles.[/green]")
-
-        # Reset session on failure so next cycle gets a fresh full prompt
-        if outcome == "failed" and state.claude_session_id:
-            state.claude_session_id = ""
-            console.print("  [dim]Session reset (cycle failed)[/dim]")
+        elif cycle_type.name == "heal" and outcome in ("success", "wrapped_up") and not health.passed:
+            # Agent says it fixed things but health check still fails —
+            # likely a config error (wrong project name, wrong scheme, etc.)
+            consecutive_heal_successes_but_health_fails += 1
+            if consecutive_heal_successes_but_health_fails >= 2:
+                console.print(Panel(
+                    "[yellow bold]Heal loop detected:[/yellow bold] Agent reports success "
+                    "but health check keeps failing. This is likely a health check "
+                    "CONFIG problem, not a code problem.\n"
+                    "Disabling health checks for the rest of this session.\n"
+                    "Fix .brewin/config.toml and restart.",
+                    border_style="yellow",
+                ))
+                config.health_check_build = None
+                config.health_check_test = None
+                baseline_healthy = True
 
         last_outcome = outcome
+
+        # Track work cycles for periodic test/cleanup insertion
+        work_cycle_types = ("deep_work", "quick_fix", "continue_work",
+                            "refactor", "debug", "perf")
+        if cycle_type.name in work_cycle_types and outcome != "failed":
+            work_cycles_since_test += 1
+            work_cycles_since_cleanup += 1
+        if cycle_type.name == "test":
+            work_cycles_since_test = 0
+        if cycle_type.name == "cleanup":
+            work_cycles_since_cleanup = 0
 
         # Consecutive failure cap — stop burning cycles on structural failures
         if outcome == "failed":
@@ -815,9 +824,11 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         hook_env.update({"BREWIN_OUTCOME": outcome, "BREWIN_FOCUS": focus})
         run_hooks(config.post_cycle_hooks, "post-cycle", env_extras=hook_env)
 
-        # Micro-replan: quick task update after work cycles (not after replan/planning)
+        # Micro-replan: quick task update after work cycles (not after replan/planning/ship)
         if (config.micro_replan
-                and cycle_type.name in ("deep_work", "quick_fix", "continue_work")
+                and cycle_type.name in ("deep_work", "quick_fix", "continue_work",
+                                        "test", "refactor", "debug", "perf",
+                                        "cleanup", "spike", "security_audit")
                 and outcome != "failed"
                 and not wrapping_up):
             replan_result = _run_micro_replan(
@@ -972,7 +983,11 @@ def main():
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--agent", default=None,
                         help="Run as a specialized agent (loads profile from .brewin/agents/<name>/)")
-    parser.add_argument("--cycle-type", choices=["planning", "quick_fix", "deep_work", "review", "replan", "heal"],
+    parser.add_argument("--cycle-type", choices=[
+                            "planning", "quick_fix", "deep_work", "review", "replan", "heal",
+                            "spike", "test", "refactor", "debug", "ship",
+                            "security_audit", "perf", "cleanup",
+                        ],
                         default=None, help="Force a specific cycle type for all cycles")
     parser.add_argument("--no-rollback", action="store_true",
                         help="Disable automatic rollback on health check failure")

@@ -12,7 +12,7 @@ from pathlib import Path
 @dataclass
 class BrewinState:
     session_id: str = ""
-    claude_session_id: str = ""  # Claude CLI session UUID for continuity
+    claude_session_id: str = ""  # Preserved for state.json compat (unused)
     project_root: str = ""
     start_time: float = 0.0
     cycle_count: int = 0
