@@ -46,6 +46,9 @@ class BrewinConfig:
     cycle_type_override: str | None = None  # Force a specific cycle type
     cycle_timeout: int | None = None  # Optional per-cycle duration limit (seconds)
 
+    # Stall detection — seconds with no output before killing a cycle
+    stall_timeout: int = 300  # 5 minutes default
+
     # Replanning
     micro_replan: bool = True  # Run a quick task-update call after each work cycle
     replan_interval: int = 4  # Insert a full replan cycle every N work cycles (0 = disabled)
@@ -158,6 +161,9 @@ def load_config(agent_name: str | None = None, **overrides) -> BrewinConfig:
 
     if "cycle_timeout" in toml_data:
         config.cycle_timeout = int(toml_data["cycle_timeout"])
+
+    if "stall_timeout" in toml_data:
+        config.stall_timeout = int(toml_data["stall_timeout"])
 
     if "replan" in toml_data:
         replan = toml_data["replan"]

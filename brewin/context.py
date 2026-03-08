@@ -24,10 +24,10 @@ def _git_output(*args: str, cwd: str | None = None, max_chars: int = 2000) -> st
 
 
 def get_git_context(cwd: str | None = None) -> str:
-    """Get recent git activity: last 5 commits + diff stat from last commit."""
+    """Get recent git activity: last 8 commits + recent file changes."""
     parts = []
 
-    log = _git_output("log", "--oneline", "-5", cwd=cwd)
+    log = _git_output("log", "--oneline", "-8", cwd=cwd)
     if log:
         parts.append(f"Recent commits:\n{log}")
 
@@ -35,12 +35,41 @@ def get_git_context(cwd: str | None = None) -> str:
     if diff_stat:
         parts.append(f"Last commit changes:\n{diff_stat}")
 
+    # Files changed in last 3 commits (broader awareness)
+    recent_files = _git_output("diff", "--name-only", "HEAD~3", cwd=cwd)
+    if recent_files:
+        parts.append(f"Files changed in last 3 commits:\n{recent_files}")
+
     # Uncommitted changes
     status = _git_output("status", "--short", cwd=cwd)
     if status:
         parts.append(f"Uncommitted changes:\n{status}")
 
     return "\n\n".join(parts) if parts else "No git context available."
+
+
+def get_recently_changed_files(n_commits: int = 10, cwd: str | None = None) -> str:
+    """Return files changed in the last N commits with change frequency."""
+    raw = _git_output(
+        "log", f"-{n_commits}", "--pretty=format:", "--name-only",
+        cwd=cwd, max_chars=5000,
+    )
+    if not raw:
+        return ""
+
+    counts: dict[str, int] = {}
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if line:
+            counts[line] = counts.get(line, 0) + 1
+
+    if not counts:
+        return ""
+
+    # Sort by frequency, take top 15
+    sorted_files = sorted(counts.items(), key=lambda x: x[1], reverse=True)[:15]
+    lines = [f"  {count}x  {path}" for path, count in sorted_files]
+    return f"Most frequently changed files (last {n_commits} commits):\n" + "\n".join(lines)
 
 
 def get_project_tree(root: str = ".", max_files: int = 100) -> str:
@@ -72,6 +101,32 @@ def get_project_tree(root: str = ".", max_files: int = 100) -> str:
                 return "\n".join(files)
 
     return "\n".join(files) if files else "Empty project."
+
+
+MEMORY_FILES = ("architecture", "decisions", "state", "learnings")
+
+
+def load_structured_memory(state_dir: str) -> dict[str, str]:
+    """Load all memory files from the memory/ directory."""
+    memory_dir = os.path.join(state_dir, "memory")
+    result = {}
+    for name in MEMORY_FILES:
+        path = os.path.join(memory_dir, f"{name}.md")
+        try:
+            with open(path) as f:
+                result[name] = f.read().strip()
+        except (FileNotFoundError, PermissionError):
+            result[name] = ""
+    return result
+
+
+def has_architecture_map(state_dir: str) -> bool:
+    """Check if a meaningful architecture map exists."""
+    path = os.path.join(state_dir, "memory", "architecture.md")
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 100
+    except OSError:
+        return False
 
 
 def get_health_summary(build_ok: bool | None, tests_ok: bool | None,

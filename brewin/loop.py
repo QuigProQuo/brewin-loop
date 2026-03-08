@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -30,13 +31,27 @@ from brewin.state import BrewinState, StateManager
 from brewin.agent import run_cycle, CycleResult
 from brewin.checkpoint import create_checkpoint, rollback_to_checkpoint, cleanup_checkpoints
 from brewin.healthcheck import run_health_check, health_regressed, is_likely_config_error, HealthCheckResult
-from brewin.context import get_git_context, get_project_tree, get_health_summary
+from brewin.context import (
+    get_git_context, get_project_tree, get_health_summary,
+    get_recently_changed_files, load_structured_memory, has_architecture_map,
+)
 from brewin.cycles import select_cycle_type
 from brewin.hooks import run_hooks, build_hook_env
 from brewin.worktree import create_agent_worktree, remove_agent_worktree, get_agent_branch
 from brewin.prompts import BREWIN_SYSTEM_PROMPT, MICRO_REPLAN_PROMPT
 
 console = Console()
+
+# Graceful shutdown flag — set by SIGINT/SIGTERM handler, checked between cycles
+_shutdown_requested = False
+
+
+def _request_shutdown(signum, frame):
+    """Signal handler that sets the shutdown flag instead of raising KeyboardInterrupt."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    sig_name = signal.Signals(signum).name
+    console.print(f"\n[yellow]Received {sig_name} — will stop after current cycle finishes.[/yellow]")
 
 
 def _read_file_safe(path: str) -> str | None:
@@ -46,17 +61,87 @@ def _read_file_safe(path: str) -> str | None:
     return None
 
 
+def _cleanup_dirty_state(work_dir: str | None) -> None:
+    """Reset uncommitted changes left by failed WIP commits or lint-staged hooks.
+    Only touches tracked files — won't delete new untracked files."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=work_dir, timeout=10,
+        )
+        if not status.stdout.strip():
+            return
+        # Unstage anything that got staged by a failed commit attempt
+        subprocess.run(
+            ["git", "reset", "HEAD", "--quiet"],
+            capture_output=True, cwd=work_dir, timeout=10,
+        )
+        # Discard modifications to tracked files (not untracked)
+        subprocess.run(
+            ["git", "checkout", "--", "."],
+            capture_output=True, cwd=work_dir, timeout=10,
+        )
+        console.print("  [dim]Cleaned up dirty state before health check[/dim]")
+    except Exception:
+        pass  # Non-critical — health check will run anyway
+
+
+def _migrate_memory(state_dir: str) -> None:
+    """Migrate flat memory.md to structured memory/ directory."""
+    old_path = os.path.join(state_dir, "memory.md")
+    memory_dir = os.path.join(state_dir, "memory")
+    new_path = os.path.join(memory_dir, "state.md")
+
+    if not os.path.isfile(old_path):
+        return
+    if os.path.isdir(memory_dir) and os.path.isfile(new_path):
+        return  # Already migrated
+
+    os.makedirs(memory_dir, exist_ok=True)
+    content = _read_file_safe(old_path) or ""
+    with open(new_path, "w") as f:
+        f.write(content)
+    os.remove(old_path)
+    console.print(f"  [dim]Migrated memory.md → memory/state.md[/dim]")
+
+
+def _fallback_memory_update(
+    config: BrewinConfig, cycle: int, focus: str, outcome: str, summary: str,
+) -> None:
+    """Append cycle results directly to memory/state.md when micro-replan fails.
+    Ensures context is never lost even if the replan subprocess crashes."""
+    state_file = os.path.join(config.state_dir, "memory", "state.md")
+    os.makedirs(os.path.dirname(state_file), exist_ok=True)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    entry = (
+        f"\n## Cycle {cycle} ({timestamp})\n"
+        f"- **Focus:** {focus}\n"
+        f"- **Outcome:** {outcome}\n"
+        f"- **Summary:** {summary}\n"
+    )
+    try:
+        with open(state_file, "a") as f:
+            f.write(entry)
+        console.print("  [dim]Fallback: appended cycle results to memory/state.md[/dim]")
+    except Exception as e:
+        console.print(f"  [dim red]Fallback memory write failed: {e}[/dim red]")
+
+
 def _run_micro_replan(
     state: BrewinState, config: BrewinConfig,
     focus: str, outcome: str, summary: str,
 ) -> CycleResult | None:
     """Run a quick, cheap replan call to update tasks and memory after a work cycle."""
     tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md")) or "(empty)"
-    memory = _read_file_safe(os.path.join(config.state_dir, "memory.md")) or "(empty)"
+    mem = load_structured_memory(config.state_dir)
 
     prompt = MICRO_REPLAN_PROMPT.format(
         focus=focus, outcome=outcome, summary=summary,
-        tasks=tasks, memory=memory,
+        tasks=tasks,
+        memory_architecture=mem.get("architecture") or "(empty)",
+        memory_decisions=mem.get("decisions") or "(empty)",
+        memory_state=mem.get("state") or "(empty)",
+        memory_learnings=mem.get("learnings") or "(empty)",
     )
 
     console.print("  [dim]Running micro-replan...[/dim]")
@@ -71,7 +156,10 @@ def _run_micro_replan(
     )
 
     if result.is_error:
-        console.print("  [yellow]Micro-replan failed (non-critical, continuing)[/yellow]")
+        console.print("  [yellow]Micro-replan failed — using fallback memory update[/yellow]")
+        _fallback_memory_update(
+            config, state.cycle_count + 1, focus, outcome, summary,
+        )
         return None
 
     console.print("  [dim]Micro-replan complete.[/dim]")
@@ -90,7 +178,7 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
     if config.agent_name:
         state_dir = config.state_dir
         prompt = prompt.replace(".brewin/tasks.md", f"{state_dir}/tasks.md")
-        prompt = prompt.replace(".brewin/memory.md", f"{state_dir}/memory.md")
+        prompt = prompt.replace(".brewin/memory/", f"{state_dir}/memory/")
     sections = []
 
     # Cycle type mode
@@ -130,15 +218,25 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
             "Mission.md and memory to decide what to work on."
         )
 
-    # Memory — persistent knowledge from previous cycles/sessions
-    memory_path = os.path.join(config.state_dir, "memory.md")
-    memory = _read_file_safe(memory_path)
-    if memory:
-        sections.append(f"## Memory (from {memory_path})\n{memory}")
+    # Memory — structured persistent knowledge from previous cycles/sessions
+    memory_dir = os.path.join(config.state_dir, "memory")
+    mem = load_structured_memory(config.state_dir)
+    has_any_memory = any(mem.values())
+    if has_any_memory:
+        mem_parts = []
+        if mem.get("architecture"):
+            mem_parts.append(f"### Architecture ({memory_dir}/architecture.md)\n{mem['architecture']}")
+        if mem.get("state"):
+            mem_parts.append(f"### State ({memory_dir}/state.md)\n{mem['state']}")
+        if mem.get("decisions"):
+            mem_parts.append(f"### Decisions ({memory_dir}/decisions.md)\n{mem['decisions']}")
+        if mem.get("learnings"):
+            mem_parts.append(f"### Learnings ({memory_dir}/learnings.md)\n{mem['learnings']}")
+        sections.append("## Memory\n" + "\n\n".join(mem_parts))
     else:
         sections.append(
-            f"## Memory\nNo memory file yet. Create `{memory_path}` at the end "
-            "of this cycle to record what you learned."
+            f"## Memory\nNo memory files yet. Create files in `{memory_dir}/` at the "
+            "end of this cycle (see MEMORY section above for file names)."
         )
 
     # Git context
@@ -146,8 +244,14 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
     if git_ctx:
         sections.append(f"## Recent Git Activity\n{git_ctx}")
 
-    # Project structure (only on first cycle to save tokens)
-    if state.cycle_count == 0:
+    # File change frequency — gives spatial awareness every cycle
+    freq = get_recently_changed_files()
+    if freq:
+        sections.append(f"## Active Development Areas\n{freq}")
+
+    # Project structure (first cycle + explore cycles)
+    is_explore = cycle_type_addendum and "EXPLORE" in cycle_type_addendum.upper()
+    if state.cycle_count == 0 or is_explore:
         tree = get_project_tree()
         if tree:
             sections.append(f"## Project Structure\n```\n{tree}\n```")
@@ -184,16 +288,26 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
 
     full_prompt = prompt + "\n\n" + "\n\n".join(sections)
 
-    # Dynamic prompt sizing — truncate if too long
+    # Dynamic prompt sizing — drop sections in priority order if too long
     if len(full_prompt) > config.max_prompt_chars:
-        had_tree = any(s.startswith("## Project Structure") for s in sections)
-        sections = [s for s in sections if not s.startswith("## Project Structure")]
-        if had_tree:
+        # Drop in order: project structure, decisions, active dev areas, learnings
+        drop_order = [
+            "## Project Structure",
+            "### Decisions",
+            "## Active Development Areas",
+            "### Learnings",
+        ]
+        for prefix in drop_order:
+            if len(full_prompt) <= config.max_prompt_chars:
+                break
+            sections = [s for s in sections if not s.startswith(prefix)]
+            full_prompt = prompt + "\n\n" + "\n\n".join(sections)
+        if len(full_prompt) > config.max_prompt_chars:
             sections.append(
-                "## Note\nProject structure was omitted to fit prompt size limits. "
+                "## Note\nSome context was omitted to fit prompt size limits. "
                 "Use `find . -type f` or `ls -R` if you need to explore the file tree."
             )
-        full_prompt = prompt + "\n\n" + "\n\n".join(sections)
+            full_prompt = prompt + "\n\n" + "\n\n".join(sections)
 
     return full_prompt
 
@@ -267,6 +381,12 @@ def _parse_tag(text: str, tag: str) -> str:
 
 def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                resume: bool = False):
+    # Install signal handlers for graceful shutdown
+    global _shutdown_requested
+    _shutdown_requested = False
+    prev_sigint = signal.signal(signal.SIGINT, _request_shutdown)
+    prev_sigterm = signal.signal(signal.SIGTERM, _request_shutdown)
+
     # Resolve state_dir early for agents (must be absolute before any chdir)
     if config.agent_name:
         config.state_dir = os.path.abspath(config.state_dir)
@@ -367,6 +487,9 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         console.print(f"\n[red]Brewin error: {e}[/red]")
         mgr.save(state)
     finally:
+        # Restore original signal handlers
+        signal.signal(signal.SIGINT, prev_sigint)
+        signal.signal(signal.SIGTERM, prev_sigterm)
         # Always restore cwd and clean up worktree
         if worktree_dir:
             os.chdir(project_root)
@@ -378,6 +501,9 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                    worktree_dir: str | None,
                    initial_direction: str | None, resume: bool):
     """Core loop logic, separated so run_brewin can wrap it in try/finally."""
+    # Migrate flat memory.md to structured memory/ directory
+    _migrate_memory(config.state_dir)
+
     # Baseline health check — know if project is already broken before we start
     baseline_health = HealthCheckResult(passed=True)
     baseline_healthy = True
@@ -422,11 +548,17 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
     last_timeout_context = ""
     consecutive_stalls = 0
     consecutive_failures = 0
+    consecutive_wrapped_up = 0
     consecutive_heal_successes_but_health_fails = 0
     work_cycles_since_test = 0
     work_cycles_since_cleanup = 0
+    work_cycles_since_explore = 0
 
     while not state.is_time_up(config.time_budget_minutes):
+        if _shutdown_requested:
+            console.print("[yellow]Shutdown requested — stopping gracefully.[/yellow]")
+            break
+
         cycle += 1
         cycle_start = time.time()
 
@@ -447,6 +579,8 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
             baseline_healthy=baseline_healthy,
             work_cycles_since_test=work_cycles_since_test,
             work_cycles_since_cleanup=work_cycles_since_cleanup,
+            has_architecture_map=has_architecture_map(config.state_dir),
+            work_cycles_since_explore=work_cycles_since_explore,
         )
 
         remaining = state.format_time_remaining(config.time_budget_minutes)
@@ -536,6 +670,7 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
             system_prompt=system_prompt,
             model=config.model,
             timeout=effective_timeout,
+            stall_timeout=config.stall_timeout,
         )
 
         # Retry on instant failure — claude CLI sometimes rejects back-to-back
@@ -559,6 +694,7 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                 system_prompt=system_prompt,
                 model=config.model,
                 timeout=effective_timeout,
+                stall_timeout=config.stall_timeout,
             )
 
         # Parse cycle results from output
@@ -588,7 +724,7 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                     summary = f"Cycle terminated abnormally{error_hint}"
 
         # Independent health check — skip for non-code cycles
-        non_code_cycles = ("planning", "replan", "spike")
+        non_code_cycles = ("planning", "replan", "spike", "explore")
         if cycle_type.name in non_code_cycles:
             health = HealthCheckResult(passed=True)
             health.build_ok = None
@@ -596,10 +732,14 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
             last_health_context = ""
             console.print("  [dim]Health check skipped (non-code cycle)[/dim]")
         else:
+            # Clean up any dirty state left by failed WIP commits or
+            # lint-staged hooks before running independent health check
+            _cleanup_dirty_state(worktree_dir)
             health = run_health_check(
                 build_cmd=config.health_check_build,
                 test_cmd=config.health_check_test,
                 timeout=config.health_check_timeout,
+                cwd=worktree_dir or None,
             )
             last_health_context = get_health_summary(
                 health.build_ok, health.tests_ok, health.test_output,
@@ -650,18 +790,53 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                 config.health_check_test = None
                 baseline_healthy = True
 
+        # Agent-mode push: push to agent branch after health check passes
+        # This ensures only verified code gets pushed, preventing concurrent
+        # sessions from stepping on each other via premature pushes.
+        if (config.agent_name and worktree_dir
+                and outcome not in ("failed",)
+                and cycle_type.name not in non_code_cycles
+                and health.passed):
+            # Safety: verify we're on an agent branch, never push to main/master
+            branch_check = subprocess.run(
+                ["git", "branch", "--show-current"],
+                capture_output=True, text=True,
+                cwd=worktree_dir, timeout=10,
+            )
+            current_branch = branch_check.stdout.strip()
+            if current_branch in ("main", "master", ""):
+                console.print(
+                    f"  [red]Push blocked — on '{current_branch}', not an agent branch.[/red]"
+                )
+            else:
+                push_result = subprocess.run(
+                    ["git", "push", "-u", "origin", "HEAD"],
+                    capture_output=True, text=True,
+                    cwd=worktree_dir, timeout=60,
+                )
+                if push_result.returncode == 0:
+                    console.print("  [green]Pushed agent branch to remote.[/green]")
+                else:
+                    console.print(
+                        f"  [yellow]Agent push failed (non-critical): "
+                        f"{push_result.stderr.strip()[-200:]}[/yellow]"
+                    )
+
         last_outcome = outcome
 
-        # Track work cycles for periodic test/cleanup insertion
+        # Track work cycles for periodic test/cleanup/explore insertion
         work_cycle_types = ("deep_work", "quick_fix", "continue_work",
                             "refactor", "debug", "perf")
         if cycle_type.name in work_cycle_types and outcome != "failed":
             work_cycles_since_test += 1
             work_cycles_since_cleanup += 1
+            work_cycles_since_explore += 1
         if cycle_type.name == "test":
             work_cycles_since_test = 0
         if cycle_type.name == "cleanup":
             work_cycles_since_cleanup = 0
+        if cycle_type.name == "explore":
+            work_cycles_since_explore = 0
 
         # Consecutive failure cap — stop burning cycles on structural failures
         if outcome == "failed":
@@ -674,6 +849,17 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                 break
         else:
             consecutive_failures = 0
+
+        # Consecutive wrapped_up cap — agent says it's done, stop the loop
+        if outcome == "wrapped_up":
+            consecutive_wrapped_up += 1
+            if consecutive_wrapped_up >= 2:
+                console.print(
+                    "[green]Agent wrapped up twice — session complete.[/green]"
+                )
+                break
+        else:
+            consecutive_wrapped_up = 0
 
         # Build timeout context for the next cycle if this one stalled/timed out
         if outcome in ("stalled", "timed_out"):
@@ -745,7 +931,8 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
         if (config.micro_replan
                 and cycle_type.name in ("deep_work", "quick_fix", "continue_work",
                                         "test", "refactor", "debug", "perf",
-                                        "cleanup", "spike", "security_audit")
+                                        "cleanup", "spike", "security_audit",
+                                        "explore")
                 and outcome != "failed"
                 and not wrapping_up):
             replan_result = _run_micro_replan(
@@ -758,6 +945,10 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                 mgr.save(state)
 
         time.sleep(config.sleep_between_cycles)
+
+        if _shutdown_requested:
+            console.print("[yellow]Shutdown requested — stopping gracefully.[/yellow]")
+            break
 
     # Session complete
     print_summary(state, config)
@@ -928,7 +1119,7 @@ def main():
     parser.add_argument("--cycle-type", choices=[
                             "planning", "quick_fix", "deep_work", "review", "replan", "heal",
                             "spike", "test", "refactor", "debug", "ship",
-                            "security_audit", "perf", "cleanup",
+                            "security_audit", "perf", "cleanup", "explore",
                         ],
                         default=None, help="Force a specific cycle type for all cycles")
     parser.add_argument("--no-rollback", action="store_true",
@@ -937,6 +1128,8 @@ def main():
                         help="Disable micro-replan after each cycle")
     parser.add_argument("--replan-interval", type=int, default=None,
                         help="Insert full replan cycle every N work cycles (0=disabled)")
+    parser.add_argument("--stall-timeout", type=int, default=None,
+                        help="Seconds with no output before killing a cycle (default: 300)")
 
     args = parser.parse_args()
 
@@ -954,6 +1147,8 @@ def main():
         config.micro_replan = False
     if args.replan_interval is not None:
         config.replan_interval = args.replan_interval
+    if args.stall_timeout is not None:
+        config.stall_timeout = args.stall_timeout
 
     if args.project != ".":
         os.chdir(args.project)

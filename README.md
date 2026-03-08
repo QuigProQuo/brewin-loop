@@ -4,6 +4,23 @@ Autonomous, time-based development agent powered by [Claude Code](https://docs.a
 
 Give it a time budget and a direction. It builds, iterates, and improves your project until the clock runs out.
 
+## Brewin Ecosystem
+
+Brewin Loop works standalone as a fully autonomous dev agent. It's also the execution engine for [Brewin Agent](https://github.com/quigproquo/brewin-agent), an intelligent orchestrator that uses Claude Haiku to reason about what cycles to run.
+
+```
+Standalone:    You → brewin (loop) → claude -p (Sonnet/Opus)
+With Agent:    You → brewin-agent (Haiku reasoning) → brewin (loop) → claude -p (Sonnet/Opus)
+```
+
+| | Brewin Loop | Brewin Agent |
+|---|---|---|
+| **Decides what to do** | Fixed priority chain | Haiku reasons about context |
+| **Handles failure** | Retry, then replan, then stop | Reasons about *why*, tries different approach |
+| **Context depth** | memory files rewritten each cycle | Agent SDK conversation + persistent journal |
+| **Knows when done** | Runs until time expires | Can stop early when tasks complete |
+| **Cost overhead** | None | Minimal (Haiku reasoning between cycles) |
+
 ## Prerequisites
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated

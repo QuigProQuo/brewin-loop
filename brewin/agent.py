@@ -16,7 +16,7 @@ from rich.panel import Panel
 
 console = Console()
 
-STALL_TIMEOUT = 300  # 5 minutes with no output = stalled
+DEFAULT_STALL_TIMEOUT = 300  # 5 minutes with no output = stalled
 
 
 @dataclass
@@ -76,9 +76,9 @@ def _save_partial_work(work_dir: str) -> tuple[str, str] | None:
         )
 
         commit = subprocess.run(
-            ["git", "commit", "-m",
+            ["git", "commit", "--no-verify", "-m",
              "brewin: WIP auto-save (cycle stalled)"],
-            cwd=work_dir, timeout=10, capture_output=True, text=True,
+            cwd=work_dir, timeout=30, capture_output=True, text=True,
         )
         if commit.returncode != 0:
             console.print(f"  [dim red]WIP commit failed: {commit.stderr.strip()[:200]}[/dim red]")
@@ -97,6 +97,7 @@ def run_cycle(
     model: str | None = None,
     cwd: str | None = None,
     timeout: int | None = None,
+    stall_timeout: int | None = None,
 ) -> CycleResult:
     """Run a single Brewin cycle via claude -p with streaming output."""
     claude_bin = _find_claude_cli()
@@ -140,9 +141,9 @@ def run_cycle(
 
         output_chunks: list[str] = []
         last_output_time = time.time()
-        # Stall timeout is always STALL_TIMEOUT (no output for N seconds).
+        # Stall timeout = no output for N seconds. Configurable via config.
         # The cycle type timeout is the max overall duration — enforced separately.
-        stall_limit = STALL_TIMEOUT
+        stall_limit = stall_timeout or DEFAULT_STALL_TIMEOUT
         max_duration = timeout  # None means no hard cap
 
         # Watchdog thread for stall detection and optional max duration

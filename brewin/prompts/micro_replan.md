@@ -9,7 +9,18 @@ Cycle summary: {summary}
 {tasks}
 
 ## Current Memory
-{memory}
+
+### Architecture (memory/architecture.md)
+{memory_architecture}
+
+### Decisions (memory/decisions.md)
+{memory_decisions}
+
+### State (memory/state.md)
+{memory_state}
+
+### Learnings (memory/learnings.md)
+{memory_learnings}
 
 ## Your Job (Be Quick)
 
@@ -18,7 +29,10 @@ Cycle summary: {summary}
 3. If the next priority task is complex, add 2-4 subtasks beneath it.
 4. If you discovered blockers, add `(BLOCKED: reason)` to affected tasks.
 5. Add any discovered issues under `## Discovered`.
-6. Update `.brewin/memory.md` with what you learned this cycle.
+6. Update `.brewin/memory/state.md` with current project status.
+7. If the cycle discovered architectural patterns or key files, update `memory/architecture.md`.
+8. If a design decision was made, append to `memory/decisions.md`.
+9. If a gotcha was discovered, append to `memory/learnings.md`.
 
 Do NOT write application code. Only update the tasks and memory files in the state directory.
 

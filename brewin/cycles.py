@@ -31,6 +31,8 @@ def select_cycle_type(
     baseline_healthy: bool = True,
     work_cycles_since_test: int = 0,
     work_cycles_since_cleanup: int = 0,
+    has_architecture_map: bool = False,
+    work_cycles_since_explore: int = 0,
 ) -> CycleType:
     """Auto-select the appropriate cycle type based on context.
 
@@ -42,9 +44,13 @@ def select_cycle_type(
         baseline_healthy: Whether the project was healthy at session start.
             If False, the first cycle(s) will be heal cycles until health passes.
         work_cycles_since_test: Number of work cycles since the last test cycle.
-            After 5, auto-insert a test cycle.
+            After 8, auto-insert a test cycle.
         work_cycles_since_cleanup: Number of work cycles since the last cleanup.
             After 10, auto-insert a cleanup cycle.
+        has_architecture_map: Whether a meaningful architecture map exists in
+            memory/architecture.md. If False, an explore cycle is triggered early.
+        work_cycles_since_explore: Number of work cycles since the last explore.
+            After 15, auto-insert an explore cycle to refresh codebase understanding.
     """
     if override and override in CYCLE_TYPES:
         return CYCLE_TYPES[override]
@@ -55,6 +61,10 @@ def select_cycle_type(
 
     if wrapping_up:
         return CYCLE_TYPES["ship"]
+
+    # On-demand explore: agent requested exploration via cycle outcome
+    if last_outcome == "needs_exploration":
+        return CYCLE_TYPES["explore"]
 
     if last_outcome in ("stalled", "timed_out"):
         if consecutive_stalls >= 2:
@@ -67,6 +77,10 @@ def select_cycle_type(
     if cycle == 1:
         return CYCLE_TYPES["planning"]
 
+    # Explore on cycle 2 if no architecture map exists
+    if cycle == 2 and not has_architecture_map:
+        return CYCLE_TYPES["explore"]
+
     # Periodic replan: after every N work cycles (cycle 2 is first work cycle)
     if replan_interval > 0 and cycle > 2:
         # Work cycles start at 2 (cycle 1 is planning)
@@ -74,9 +88,13 @@ def select_cycle_type(
         if work_cycle % replan_interval == 0:
             return CYCLE_TYPES["replan"]
 
-    # Periodic test cycle: after 5 work cycles without dedicated testing
-    if work_cycles_since_test >= 5:
+    # Periodic test cycle: after 8 work cycles without dedicated testing
+    if work_cycles_since_test >= 8:
         return CYCLE_TYPES["test"]
+
+    # Periodic explore: refresh codebase understanding after 15 work cycles
+    if work_cycles_since_explore >= 15:
+        return CYCLE_TYPES["explore"]
 
     # Periodic cleanup: after 10 work cycles without cleanup
     if work_cycles_since_cleanup >= 10:

@@ -11,7 +11,7 @@ brewin/
   cycles.py        — Cycle type definitions + selection algorithm
   config.py        — Config loading from .brewin/config.toml + CLI args
   state.py         — Session state persistence (state.json), cycle logging
-  context.py       — Git context, project tree, health summaries
+  context.py       — Git context, project tree, health summaries, structured memory loading
   healthcheck.py   — Independent build/test verification, regression detection
   checkpoint.py    — Git tag checkpoints and rollback
   hooks.py         — Pre/post-cycle hook execution
@@ -26,8 +26,9 @@ brewin/
 ## How Prompts Work
 
 - Prompts live in `brewin/prompts/` as markdown files, loaded once at import time
-- `_build_system_prompt()` in loop.py assembles the full system prompt each cycle by combining: core system prompt + cycle type addendum + mission + tasks + memory + git context + health results + time remaining
-- `MICRO_REPLAN_PROMPT` uses Python `.format()` placeholders (`{focus}`, `{outcome}`, etc.) and `{{` for literal braces
+- `_build_system_prompt()` in loop.py assembles the full system prompt each cycle by combining: core system prompt + cycle type addendum + mission + tasks + structured memory (4 files) + git context + file change frequency + health results + time remaining
+- `MICRO_REPLAN_PROMPT` uses Python `.format()` placeholders (`{focus}`, `{outcome}`, `{memory_architecture}`, `{memory_state}`, etc.) and `{{` for literal braces
+- Memory is structured into 4 files in `.brewin/memory/`: architecture.md, decisions.md, state.md, learnings.md
 - To add a new cycle type: create a `.md` file in `prompts/cycles/`, then add the name to `select_cycle_type()` logic in cycles.py
 
 ## How Cycle Selection Works
@@ -36,14 +37,17 @@ brewin/
 
 1. **heal** — if baseline health check failed
 2. **ship** — if wrapping up (near time limit)
-3. **replan** — if 2+ consecutive stalls
-4. **continue_work** — if previous cycle stalled/timed out
-5. **review** — if previous cycle failed
-6. **planning** — first cycle of session
-7. **replan** — periodic (every N work cycles)
-8. **test** — periodic (every 5 work cycles)
-9. **cleanup** — periodic (every 10 work cycles)
-10. **deep_work** — default
+3. **explore** — if agent reported `needs_exploration` outcome
+4. **replan** — if 2+ consecutive stalls
+5. **continue_work** — if previous cycle stalled/timed out
+6. **review** — if previous cycle failed
+7. **planning** — first cycle of session
+8. **explore** — cycle 2 if no architecture map exists in memory/
+9. **replan** — periodic (every N work cycles)
+10. **test** — periodic (every 8 work cycles)
+11. **explore** — periodic (every 15 work cycles)
+12. **cleanup** — periodic (every 10 work cycles)
+13. **deep_work** — default
 
 ## Key Patterns
 
