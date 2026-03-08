@@ -6,6 +6,7 @@ on the same repo simultaneously without conflicts.
 """
 
 import os
+import shutil
 import subprocess
 from datetime import datetime, timezone
 
@@ -38,12 +39,12 @@ def create_agent_worktree(
     worktree_dir = os.path.join(project_root, ".brewin", "worktrees", agent_name)
 
     # Clean up stale worktree if it exists
+    # Use shutil.rmtree instead of `git worktree remove` because the latter
+    # times out on large directories (e.g. node_modules symlinks).
     if os.path.isdir(worktree_dir):
         console.print(f"  [dim]Cleaning up stale worktree at {worktree_dir}[/dim]")
-        _git("worktree", "remove", "--force", worktree_dir, cwd=project_root)
-
-    # Prune any stale worktree references
-    _git("worktree", "prune", cwd=project_root)
+        shutil.rmtree(worktree_dir, ignore_errors=True)
+        _git("worktree", "prune", cwd=project_root)
 
     # Create the worktree with a new branch from current HEAD
     result = _git(

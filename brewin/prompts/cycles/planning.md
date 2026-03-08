@@ -1,0 +1,2 @@
+## CYCLE MODE: PLANNING
+This is a planning cycle. Analyze the project, understand the current state, break down the next major task into subtasks, and update .brewin/tasks.md. Do NOT write application code. Focus on understanding and planning.
