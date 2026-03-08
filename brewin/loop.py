@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -421,6 +422,10 @@ def _parse_tag(text: str, tag: str) -> str:
 
 def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                resume: bool = False):
+    # Resolve state_dir early for agents (must be absolute before any chdir)
+    if config.agent_name:
+        config.state_dir = os.path.abspath(config.state_dir)
+        config.mission_file = os.path.abspath(config.mission_file)
     mgr = StateManager(config.state_dir)
     project_root = os.getcwd()
     worktree_dir = None
@@ -487,6 +492,25 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                if initial_direction else ""),
             border_style="bold magenta" if config.agent_name else "bold blue",
         ))
+
+    # Worktree setup — install dependencies if running in a worktree
+    if worktree_dir and config.worktree_setup:
+        console.print(f"[dim]Running worktree setup: {config.worktree_setup}[/dim]")
+        try:
+            result = subprocess.run(
+                config.worktree_setup, shell=True,
+                capture_output=True, text=True,
+                timeout=300, cwd=worktree_dir,
+            )
+            if result.returncode == 0:
+                console.print("[green]Worktree setup complete.[/green]")
+            else:
+                console.print(
+                    f"[yellow]Worktree setup exited {result.returncode}[/yellow]\n"
+                    f"  {result.stderr.strip()[-200:]}"
+                )
+        except subprocess.TimeoutExpired:
+            console.print("[yellow]Worktree setup timed out (300s)[/yellow]")
 
     # Baseline health check — know if project is already broken before we start
     baseline_health = HealthCheckResult(passed=True)

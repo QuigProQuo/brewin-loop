@@ -31,6 +31,7 @@ class BrewinConfig:
 
     # Agent mode
     agent_name: str | None = None
+    worktree_setup: str | None = None  # Shell command to run after worktree creation (e.g., "pnpm install")
 
     # Wrap-up: when fewer than this many minutes remain, tell Claude to wrap up
     wrap_up_minutes: int = 5
@@ -137,6 +138,8 @@ def load_config(agent_name: str | None = None, **overrides) -> BrewinConfig:
             config.health_check_timeout = int(health["timeout"])
         if "rollback_on_failure" in health:
             config.rollback_on_failure = bool(health["rollback_on_failure"])
+        if "worktree_setup" in health:
+            config.worktree_setup = health["worktree_setup"]
 
     if "hooks" in toml_data:
         hooks = toml_data["hooks"]
