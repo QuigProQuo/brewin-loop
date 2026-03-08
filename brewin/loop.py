@@ -776,6 +776,14 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
         cleanup_checkpoints(state.session_id)
 
 
+def _get_outstanding_tasks(config: BrewinConfig) -> list[str]:
+    """Return unchecked task lines from tasks.md."""
+    tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md"))
+    if not tasks:
+        return []
+    return [line.strip() for line in tasks.splitlines() if line.strip().startswith("- [ ]")]
+
+
 def print_summary(state: BrewinState, config: BrewinConfig):
     table = Table(title="Brewin Session Summary", border_style="blue")
     table.add_column("Cycle", style="cyan", justify="right")
@@ -812,6 +820,15 @@ def print_summary(state: BrewinState, config: BrewinConfig):
         border_style="bold blue",
     ))
 
+    outstanding = _get_outstanding_tasks(config)
+    if outstanding:
+        task_list = "\n".join(f"  {t}" for t in outstanding)
+        console.print(Panel(
+            task_list,
+            title="Outstanding Tasks",
+            border_style="yellow",
+        ))
+
 
 def _save_session_log(state: BrewinState, config: BrewinConfig):
     """Save a session log to .brewin/sessions/ for historical reference."""
@@ -840,6 +857,14 @@ def _save_session_log(state: BrewinState, config: BrewinConfig):
         lines.append(f"- Tokens: {e.get('input_tokens', 0):,}in / {e.get('output_tokens', 0):,}out")
         if e.get("summary"):
             lines.append(f"- Summary: {e['summary']}")
+        lines.append("")
+
+    outstanding = _get_outstanding_tasks(config)
+    if outstanding:
+        lines.append("## Outstanding Tasks")
+        lines.append("")
+        for t in outstanding:
+            lines.append(t)
         lines.append("")
 
     with open(log_file, "w") as f:
