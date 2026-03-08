@@ -512,6 +512,27 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         except subprocess.TimeoutExpired:
             console.print("[yellow]Worktree setup timed out (300s)[/yellow]")
 
+    try:
+        _run_main_loop(config, state, mgr, project_root, worktree_dir,
+                        initial_direction, resume)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted. Saving state...[/yellow]")
+        mgr.save(state)
+    except Exception as e:
+        console.print(f"\n[red]Brewin error: {e}[/red]")
+        mgr.save(state)
+    finally:
+        # Always restore cwd and clean up worktree
+        if worktree_dir:
+            os.chdir(project_root)
+            console.print(f"  [dim]Restored cwd to {project_root}[/dim]")
+
+
+def _run_main_loop(config: BrewinConfig, state: BrewinState,
+                   mgr: StateManager, project_root: str,
+                   worktree_dir: str | None,
+                   initial_direction: str | None, resume: bool):
+    """Core loop logic, separated so run_brewin can wrap it in try/finally."""
     # Baseline health check — know if project is already broken before we start
     baseline_health = HealthCheckResult(passed=True)
     baseline_healthy = True
@@ -672,6 +693,29 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             timeout=effective_timeout,
         )
 
+        # Retry on instant failure — claude CLI sometimes rejects back-to-back
+        # invocations (e.g. after micro-replan). If the cycle failed in < 5s
+        # with zero output, wait and retry once.
+        instant_fail = (
+            cycle_result.is_error
+            and cycle_result.input_tokens == 0
+            and cycle_result.output_tokens == 0
+            and cycle_result.duration_seconds < 5
+        )
+        if instant_fail:
+            console.print(
+                f"  [yellow]Instant failure detected — retrying after 10s...[/yellow]"
+            )
+            if cycle_result.output:
+                console.print(f"  [dim]Error: {cycle_result.output[:300]}[/dim]")
+            time.sleep(10)
+            cycle_result = run_cycle(
+                user_message=user_message,
+                system_prompt=system_prompt,
+                model=config.model,
+                timeout=effective_timeout,
+            )
+
         # Parse cycle results from output
         cycle_duration = time.time() - cycle_start
         parsed = _parse_cycle_result(cycle_result.output)
@@ -692,7 +736,11 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             elif outcome not in ("failed",):
                 outcome = "failed"
                 if not summary:
-                    summary = "Cycle terminated abnormally"
+                    # Include error output for diagnosis
+                    error_hint = ""
+                    if cycle_result.output:
+                        error_hint = f": {cycle_result.output[:200]}"
+                    summary = f"Cycle terminated abnormally{error_hint}"
 
         # Independent health check — skip for non-code cycles
         non_code_cycles = ("planning", "replan", "spike")

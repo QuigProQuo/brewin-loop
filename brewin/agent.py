@@ -63,6 +63,7 @@ def _save_partial_work(work_dir: str) -> tuple[str, str] | None:
         # Stage everything first so we capture new untracked files in the diff
         subprocess.run(
             ["git", "add", "-A"], cwd=work_dir, timeout=10,
+            capture_output=True,
         )
 
         diff_stat = subprocess.run(
@@ -74,11 +75,14 @@ def _save_partial_work(work_dir: str) -> tuple[str, str] | None:
             capture_output=True, text=True, cwd=work_dir, timeout=10,
         )
 
-        subprocess.run(
+        commit = subprocess.run(
             ["git", "commit", "-m",
              "brewin: WIP auto-save (cycle stalled)"],
-            cwd=work_dir, timeout=10,
+            cwd=work_dir, timeout=10, capture_output=True, text=True,
         )
+        if commit.returncode != 0:
+            console.print(f"  [dim red]WIP commit failed: {commit.stderr.strip()[:200]}[/dim red]")
+            return None
 
         console.print("  [yellow]Partial work auto-saved as WIP commit[/yellow]")
         return (diff_stat.stdout.strip(), diff_detail.stdout.strip())
@@ -173,28 +177,32 @@ def run_cycle(
             console.print(f"\n[red]{reason}[/red]")
 
         def watchdog():
-            while proc.poll() is None and not stalled.is_set():
-                now = time.time()
-                stall_elapsed = now - last_output_time
-                total_elapsed = now - start_time
+            try:
+                while proc.poll() is None and not stalled.is_set():
+                    now = time.time()
+                    stall_elapsed = now - last_output_time
+                    total_elapsed = now - start_time
 
-                # Check optional max duration first
-                if max_duration and total_elapsed > max_duration:
-                    _kill_proc(
-                        f"Cycle duration limit reached ({max_duration}s). "
-                        "Terminating.",
-                        kill_type="duration",
-                    )
-                    return
+                    # Check optional max duration first
+                    if max_duration and total_elapsed > max_duration:
+                        _kill_proc(
+                            f"Cycle duration limit reached ({max_duration}s). "
+                            "Terminating.",
+                            kill_type="duration",
+                        )
+                        return
 
-                if stall_elapsed > stall_limit:
-                    _kill_proc(
-                        f"Stall detected ({stall_limit}s with no output). "
-                        "Terminating cycle.",
-                        kill_type="stall",
-                    )
-                    return
-                time.sleep(5)
+                    if stall_elapsed > stall_limit:
+                        _kill_proc(
+                            f"Stall detected ({stall_limit}s with no output). "
+                            "Terminating cycle.",
+                            kill_type="stall",
+                        )
+                        return
+                    time.sleep(5)
+            except Exception as e:
+                console.print(f"  [dim red]Watchdog error: {e}[/dim red]")
+                stalled.set()
 
         watcher = threading.Thread(target=watchdog, daemon=True)
         watcher.start()
@@ -213,7 +221,11 @@ def run_cycle(
 
             _handle_stream_event(event, output_chunks, result)
 
-        proc.wait()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
         stalled.set()  # Stop watchdog
 
         result.output = "".join(output_chunks)

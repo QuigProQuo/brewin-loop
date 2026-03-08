@@ -82,7 +82,7 @@ class StateManager:
     def load(self) -> BrewinState:
         if self.state_file.exists():
             try:
-                with open(self.state_file) as f:
+                with open(self.state_file, encoding="utf-8") as f:
                     data = json.load(f)
                 return BrewinState(**{
                     k: v for k, v in data.items()
@@ -94,7 +94,7 @@ class StateManager:
 
     def save(self, state: BrewinState):
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.state_file, "w") as f:
+        with open(self.state_file, "w", encoding="utf-8") as f:
             json.dump(asdict(state), f, indent=2)
 
     def reset(self) -> BrewinState:
