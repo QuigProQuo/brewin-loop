@@ -14,10 +14,10 @@ Give it a time budget and a direction. It builds, iterates, and improves your pr
 
 ```bash
 # From GitHub
-uv tool install git+https://github.com/johnpeterquigley/brewin-loop
+uv tool install git+https://github.com/quigproquo/brewin-loop
 
 # Or clone and install locally
-git clone https://github.com/johnpeterquigley/brewin-loop.git
+git clone https://github.com/quigproquo/brewin-loop.git
 cd brewin-loop
 uv tool install .
 ```
@@ -73,16 +73,33 @@ Brewin streams Claude's output in real-time via `stream-json`. You see tool call
 
 ### Adaptive Cycle Types
 
-Brewin automatically selects the right cycle type based on context:
+Brewin automatically selects the right cycle type based on context. The selection follows a priority chain — the first matching condition wins:
 
-| Type | Timeout | When |
-|------|---------|------|
-| `planning` | 5min | First cycle of a new session |
-| `deep_work` | 30min | Default for most cycles |
-| `quick_fix` | 5min | Wrapping up near time limit |
-| `review` | 10min | After a failed cycle |
+| Priority | Type | Trigger |
+|----------|------|---------|
+| 1 | `heal` | Build/tests failing at baseline |
+| 2 | `ship` | Near time limit — wrap up cleanly |
+| 3 | `replan` | 2+ consecutive stalls |
+| 4 | `continue_work` | After a stall or timeout |
+| 5 | `review` | After a failed cycle |
+| 6 | `planning` | First cycle of a new session |
+| 7 | `replan` | Periodic (every N work cycles, configurable) |
+| 8 | `test` | Every 5 work cycles |
+| 9 | `cleanup` | Every 10 work cycles |
+| 10 | `deep_work` | Default — most cycles are this |
 
-Override with `--cycle-type <type>`.
+Additional cycle types available via `--cycle-type`:
+
+| Type | Purpose |
+|------|---------|
+| `quick_fix` | Single small fix, commit, move on |
+| `refactor` | Behavior-preserving restructuring only |
+| `debug` | Systematic bug investigation |
+| `spike` | Research/investigation — no code committed |
+| `security_audit` | Vulnerability review |
+| `perf` | Profile, benchmark, optimize |
+
+Each cycle type has its own prompt that scopes and constrains Claude's behavior — a `heal` cycle won't start features, a `deep_work` cycle won't do code reviews, a `spike` cycle won't commit application code.
 
 ### Git Checkpoints & Rollback
 
@@ -184,7 +201,7 @@ Hook commands receive environment variables: `BREWIN_CYCLE`, `BREWIN_OUTCOME`, `
 | `--project` | `.` | Project directory |
 | `--resume` | — | Resume previous session |
 | `--status` | — | Show last session status |
-| `--cycle-type` | auto | Force cycle type: `planning`, `deep_work`, `quick_fix`, `review` |
+| `--cycle-type` | auto | Force a cycle type (any from the tables above) |
 | `--no-rollback` | — | Disable automatic rollback on health check failure |
 
 Environment variables: `BREWIN_MODEL`, `BREWIN_TIME`, `BREWIN_MODE`, `BREWIN_MAX_CYCLES`
