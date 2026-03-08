@@ -29,6 +29,9 @@ class BrewinConfig:
     mission_file: str = "Mission.md"
     state_dir: str = ".brewin"
 
+    # Agent mode
+    agent_name: str | None = None
+
     # Wrap-up: when fewer than this many minutes remain, tell Claude to wrap up
     wrap_up_minutes: int = 5
 
@@ -89,11 +92,39 @@ def _load_toml_config(state_dir: str = ".brewin") -> dict:
         return {}
 
 
-def load_config(**overrides) -> BrewinConfig:
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Deep-merge override into base. Override values win for scalars;
+    dicts are merged recursively; lists are replaced."""
+    merged = base.copy()
+    for key, val in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+            merged[key] = _deep_merge(merged[key], val)
+        else:
+            merged[key] = val
+    return merged
+
+
+def load_config(agent_name: str | None = None, **overrides) -> BrewinConfig:
     config = BrewinConfig()
 
-    # Load from .brewin/config.toml
-    toml_data = _load_toml_config(config.state_dir)
+    # When running as an agent, state_dir points to the agent's directory
+    if agent_name:
+        agent_dir = os.path.join(".brewin", "agents", agent_name)
+        if not os.path.isdir(agent_dir):
+            raise FileNotFoundError(
+                f"Agent directory not found: {agent_dir}\n"
+                f"Create it with mission.md and tasks.md before running."
+            )
+        config.state_dir = agent_dir
+        config.agent_name = agent_name
+
+    # Load root config, then merge agent-specific config on top
+    root_toml = _load_toml_config(".brewin")
+    if agent_name:
+        agent_toml = _load_toml_config(config.state_dir)
+        toml_data = _deep_merge(root_toml, agent_toml)
+    else:
+        toml_data = root_toml
 
     # Apply TOML settings
     if "health" in toml_data:

@@ -28,10 +28,11 @@ from brewin.config import BrewinConfig, load_config, detect_project_type
 from brewin.state import BrewinState, StateManager
 from brewin.agent import run_cycle, CycleResult
 from brewin.checkpoint import create_checkpoint, rollback_to_checkpoint, cleanup_checkpoints
-from brewin.healthcheck import run_health_check, health_regressed, HealthCheckResult
+from brewin.healthcheck import run_health_check, health_regressed, is_likely_config_error, HealthCheckResult
 from brewin.context import get_git_context, get_project_tree, get_health_summary
 from brewin.cycles import select_cycle_type
 from brewin.hooks import run_hooks, build_hook_env
+from brewin.worktree import create_agent_worktree, remove_agent_worktree, get_agent_branch
 
 console = Console()
 
@@ -63,7 +64,7 @@ Cycle summary: {summary}
 5. Add any discovered issues under `## Discovered`.
 6. Update `.brewin/memory.md` with what you learned this cycle.
 
-Do NOT write application code. Only update `.brewin/tasks.md` and `.brewin/memory.md`.
+Do NOT write application code. Only update the tasks and memory files in the state directory.
 
 End with:
 ```json
@@ -248,16 +249,29 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
                          timeout_context: str = "") -> str:
     """Build the full system prompt for cycle 1."""
     prompt = BREWIN_SYSTEM_PROMPT
+    # Replace .brewin/ references with agent-specific paths when in agent mode
+    if config.agent_name:
+        state_dir = config.state_dir
+        prompt = prompt.replace(".brewin/tasks.md", f"{state_dir}/tasks.md")
+        prompt = prompt.replace(".brewin/memory.md", f"{state_dir}/memory.md")
     sections = []
 
     # Cycle type mode
     if cycle_type_addendum:
         sections.append(cycle_type_addendum)
 
-    # Mission
-    mission = _read_file_safe(config.mission_file)
-    if mission:
-        sections.append(f"## Mission (from Mission.md)\n{mission}")
+    # Mission — agent-specific mission.md takes priority over root Mission.md
+    agent_mission = None
+    if config.agent_name:
+        agent_mission = _read_file_safe(os.path.join(config.state_dir, "mission.md"))
+    root_mission = _read_file_safe(config.mission_file)
+
+    if agent_mission:
+        sections.append(f"## Agent Mission (from {config.state_dir}/mission.md)\n{agent_mission}")
+        if root_mission:
+            sections.append(f"## Project Mission (from Mission.md)\n{root_mission}")
+    elif root_mission:
+        sections.append(f"## Mission (from Mission.md)\n{root_mission}")
     else:
         sections.append(
             "## Mission\nNo Mission.md found. Create one to give the project direction."
@@ -416,6 +430,8 @@ def _parse_tag(text: str, tag: str) -> str:
 def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
                resume: bool = False):
     mgr = StateManager(config.state_dir)
+    project_root = os.getcwd()
+    worktree_dir = None
 
     if resume:
         state = mgr.load()
@@ -425,13 +441,22 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
 
     if resume:
         state.start_time = time.time()
+        agent_label = f" [bold magenta]({config.agent_name})[/bold magenta]" if config.agent_name else ""
         console.print(Panel(
-            f"[bold]Resuming Brewin[/bold]\n"
+            f"[bold]Resuming Brewin[/bold]{agent_label}\n"
             f"  Cycles done: [cyan]{state.cycle_count}[/cyan]\n"
             f"  New budget:  [cyan]{config.time_budget_minutes}m[/cyan]\n"
             f"  Session:     [dim]{state.session_id}[/dim]",
             border_style="yellow",
         ))
+
+        # For agent resume, check for existing worktree
+        if config.agent_name:
+            wt_path = os.path.join(project_root, ".brewin", "worktrees", config.agent_name)
+            if os.path.isdir(wt_path):
+                worktree_dir = os.path.abspath(wt_path)
+                os.chdir(worktree_dir)
+                console.print(f"  [dim]Resumed in worktree: {worktree_dir}[/dim]")
     else:
         state = mgr.reset()
         state.start_time = time.time()
@@ -439,19 +464,37 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         state.session_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         state.claude_session_id = ""
 
+        # Create worktree for agent mode
+        if config.agent_name:
+            worktree_dir = create_agent_worktree(config.agent_name, project_root)
+            os.chdir(worktree_dir)
+            state.project_root = worktree_dir
+
     project_type = detect_project_type()
 
     if not resume:
+        agent_label = ""
+        agent_info = ""
+        if config.agent_name:
+            agent_label = f" [bold magenta]Agent: {config.agent_name}[/bold magenta]\n"
+            branch = get_agent_branch(config.agent_name, project_root)
+            if branch:
+                agent_info = f"\n  Branch:       [magenta]{branch}[/magenta]"
+            if worktree_dir:
+                agent_info += f"\n  Worktree:     [dim]{worktree_dir}[/dim]"
+
         console.print(Panel(
-            f"[bold]Brewin Loop[/bold] — Autonomous Development Agent\n\n"
+            f"[bold]Brewin Loop[/bold] — Autonomous Development Agent\n"
+            f"{agent_label}\n"
             f"  Time budget:  [cyan]{config.time_budget_minutes}m[/cyan]\n"
             f"  Project:      [cyan]{project_type}[/cyan]\n"
             f"  Model:        [cyan]{config.model}[/cyan]\n"
             f"  Mode:         [cyan]{config.autonomy_mode}[/cyan]\n"
             f"  Session:      [dim]{state.session_id}[/dim]"
+            + agent_info
             + (f"\n  Direction:    [green]{initial_direction}[/green]"
                if initial_direction else ""),
-            border_style="bold blue",
+            border_style="bold magenta" if config.agent_name else "bold blue",
         ))
 
     # Baseline health check — know if project is already broken before we start
@@ -466,12 +509,31 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         )
         baseline_healthy = baseline_health.passed
         if not baseline_healthy:
-            console.print(Panel(
-                "[red bold]Baseline health check FAILED[/red bold]\n"
-                "The project is already broken. Entering heal mode to fix "
-                "build/test failures before starting real work.",
-                border_style="red",
-            ))
+            if is_likely_config_error(baseline_health):
+                output_hint = ""
+                if baseline_health.build_output:
+                    output_hint += f"\nBuild: {baseline_health.build_output[-200:]}"
+                if baseline_health.test_output:
+                    output_hint += f"\nTest: {baseline_health.test_output[-200:]}"
+                console.print(Panel(
+                    "[red bold]Health check looks like a CONFIG ERROR[/red bold]\n"
+                    "The commands in .brewin/config.toml appear to reference "
+                    "missing files or paths."
+                    + output_hint
+                    + "\n\nHealth checks disabled for this session. "
+                    "Fix .brewin/config.toml and restart.",
+                    border_style="red",
+                ))
+                config.health_check_build = None
+                config.health_check_test = None
+                baseline_healthy = True
+            else:
+                console.print(Panel(
+                    "[red bold]Baseline health check FAILED[/red bold]\n"
+                    "The project is already broken. Entering heal mode to fix "
+                    "build/test failures before starting real work.",
+                    border_style="red",
+                ))
 
     cycle = state.cycle_count
     last_outcome: str | None = None
@@ -544,7 +606,9 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
         if cycle_type.name == "heal" and not heal_health_context:
             heal_health_context = get_health_summary(
                 baseline_health.build_ok, baseline_health.tests_ok,
-                baseline_health.test_output,
+                baseline_health.test_output, baseline_health.build_output,
+                build_cmd=config.health_check_build,
+                test_cmd=config.health_check_test,
             )
 
         # Always build system prompt — session continuity may not work in -p mode
@@ -633,6 +697,9 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             )
             last_health_context = get_health_summary(
                 health.build_ok, health.tests_ok, health.test_output,
+                health.build_output,
+                build_cmd=config.health_check_build,
+                test_cmd=config.health_check_test,
             )
 
         # Rollback only on REGRESSION — if baseline was already broken and the
@@ -870,6 +937,29 @@ def show_status(config: BrewinConfig):
     console.print(state.get_history_summary())
 
 
+def _show_agent_status(config: BrewinConfig, agent_name: str):
+    """Show status for a specific agent."""
+    mgr = StateManager(config.state_dir)
+    state = mgr.load()
+
+    if state.cycle_count == 0:
+        console.print(f"[dim]No session found for agent '{agent_name}'.[/dim]")
+        return
+
+    branch = get_agent_branch(agent_name, os.getcwd())
+    console.print(Panel(
+        f"  Agent:   [magenta]{agent_name}[/magenta]\n"
+        f"  Session: {state.session_id}\n"
+        f"  Cycles:  {state.cycle_count}\n"
+        f"  Branch:  {branch or 'none'}\n"
+        f"  Tokens:  {state.total_input_tokens:,}in / {state.total_output_tokens:,}out\n"
+        f"  Cost:    ${state.total_cost_usd:.4f}",
+        title=f"Agent: {agent_name}",
+        border_style="magenta",
+    ))
+    console.print(state.get_history_summary())
+
+
 def main():
     parser = argparse.ArgumentParser(description="Brewin Loop — autonomous development agent")
     parser.add_argument("direction", nargs="*", default=[])
@@ -880,6 +970,8 @@ def main():
     parser.add_argument("--project", "-p", default=".")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--agent", default=None,
+                        help="Run as a specialized agent (loads profile from .brewin/agents/<name>/)")
     parser.add_argument("--cycle-type", choices=["planning", "quick_fix", "deep_work", "review", "replan", "heal"],
                         default=None, help="Force a specific cycle type for all cycles")
     parser.add_argument("--no-rollback", action="store_true",
@@ -892,6 +984,7 @@ def main():
     args = parser.parse_args()
 
     config = load_config(
+        agent_name=args.agent,
         time_budget_minutes=args.time,
         autonomy_mode=args.mode,
         model=args.model,
@@ -909,7 +1002,11 @@ def main():
         os.chdir(args.project)
 
     if args.status:
-        show_status(config)
+        if args.agent:
+            # List all agents or show specific agent status
+            _show_agent_status(config, args.agent)
+        else:
+            show_status(config)
         return
 
     direction = " ".join(args.direction) if args.direction else None

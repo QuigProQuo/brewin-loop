@@ -75,14 +75,24 @@ def get_project_tree(root: str = ".", max_files: int = 100) -> str:
 
 
 def get_health_summary(build_ok: bool | None, tests_ok: bool | None,
-                       test_output: str = "") -> str:
+                       test_output: str = "", build_output: str = "",
+                       build_cmd: str | None = None,
+                       test_cmd: str | None = None) -> str:
     """Format health check results for inclusion in prompts."""
     parts = []
+
+    if build_cmd:
+        parts.append(f"Build command: `{build_cmd}`")
+    if test_cmd:
+        parts.append(f"Test command: `{test_cmd}`")
 
     if build_ok is True:
         parts.append("Build: PASSING")
     elif build_ok is False:
         parts.append("Build: FAILING")
+        if build_output:
+            lines = build_output.strip().splitlines()[-15:]
+            parts.append("Build output (last 15 lines):\n" + "\n".join(lines))
 
     if tests_ok is True:
         parts.append("Tests: PASSING")

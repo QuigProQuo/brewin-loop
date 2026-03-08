@@ -101,6 +101,24 @@ def detect_build_command(root: str = ".") -> str | None:
     return None
 
 
+def is_likely_config_error(result: HealthCheckResult) -> bool:
+    """Detect if a health check failure is likely a config problem, not broken code.
+
+    Heuristics: output contains path-related error patterns indicating missing
+    files, directories, or commands rather than actual build/test failures.
+    """
+    error_patterns = [
+        "no such file", "not found", "does not exist",
+        "unable to locate", "command not found",
+        "no such directory", "cannot find",
+    ]
+    for output in (result.build_output, result.test_output):
+        lower = output.lower()
+        if any(pat in lower for pat in error_patterns):
+            return True
+    return False
+
+
 def health_regressed(baseline: HealthCheckResult, current: HealthCheckResult) -> bool:
     """Return True if current health is worse than baseline.
 
