@@ -59,6 +59,9 @@ class BrewinConfig:
     post_cycle_hooks: list[str] = field(default_factory=list)
     post_session_hooks: list[str] = field(default_factory=list)
 
+    # Workflow — "development" (default) or "research" (no health checks, research cycles)
+    workflow: str = "development"
+
     # Prompt limits
     max_prompt_chars: int = 15000
 
@@ -155,6 +158,9 @@ def load_config(agent_name: str | None = None, **overrides) -> BrewinConfig:
 
     if "model" in toml_data:
         config.model = toml_data["model"]
+
+    if "workflow" in toml_data:
+        config.workflow = toml_data["workflow"]
 
     if "cycle_type" in toml_data:
         config.cycle_type_override = toml_data["cycle_type"]

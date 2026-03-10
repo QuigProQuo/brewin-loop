@@ -49,6 +49,37 @@ brewin/
 12. **cleanup** — periodic (every 10 work cycles)
 13. **deep_work** — default
 
+## Workflows
+
+Brewin supports two workflows, set via `workflow` in config.toml:
+
+### `development` (default)
+Code-focused: health checks, rollback, git checkpoints, test/cleanup cycles.
+
+### `research`
+Investigation-focused: no health checks, no rollback, no git checkpoints.
+Uses `research` cycles (with WebSearch/WebFetch) instead of `deep_work`,
+and periodic `synthesize` cycles (every 5 research cycles) to consolidate findings.
+Reports go to `.brewin/reports/`. Agent config example:
+
+```toml
+workflow = "research"
+
+[health]
+build = "true"
+test = "true"
+```
+
+Research cycle selection priority chain:
+1. **ship** — wrapping up
+2. **replan** — 2+ consecutive stalls, or failed
+3. **continue_work** — previous cycle stalled/timed out
+4. **planning** — first cycle
+5. **explore** — cycle 2 (understand codebase)
+6. **replan** — periodic
+7. **synthesize** — every 5 research cycles
+8. **research** — default
+
 ## Key Patterns
 
 - Each cycle is a fresh `claude -p` subprocess (no session continuity — it crashed)

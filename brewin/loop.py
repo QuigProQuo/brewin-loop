@@ -505,9 +505,12 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
     _migrate_memory(config.state_dir)
 
     # Baseline health check — know if project is already broken before we start
+    # Skip entirely for research workflow (no code to validate)
     baseline_health = HealthCheckResult(passed=True)
     baseline_healthy = True
-    if config.health_check_build or config.health_check_test:
+    if config.workflow == "research":
+        console.print("[dim]Research workflow — health checks disabled.[/dim]")
+    elif config.health_check_build or config.health_check_test:
         console.print("[dim]Running baseline health check...[/dim]")
         baseline_health = run_health_check(
             build_cmd=config.health_check_build,
@@ -553,6 +556,8 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
     work_cycles_since_test = 0
     work_cycles_since_cleanup = 0
     work_cycles_since_explore = 0
+    work_cycles_since_synthesize = 0
+    is_research = config.workflow == "research"
 
     while not state.is_time_up(config.time_budget_minutes):
         if _shutdown_requested:
@@ -581,6 +586,8 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
             work_cycles_since_cleanup=work_cycles_since_cleanup,
             has_architecture_map=has_architecture_map(config.state_dir),
             work_cycles_since_explore=work_cycles_since_explore,
+            workflow=config.workflow,
+            work_cycles_since_synthesize=work_cycles_since_synthesize,
         )
 
         remaining = state.format_time_remaining(config.time_budget_minutes)
@@ -612,8 +619,8 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
         )
         run_hooks(config.pre_cycle_hooks, "pre-cycle", env_extras=hook_env)
 
-        # Git checkpoint (skip for non-committing cycles)
-        if cycle_type.name == "spike":
+        # Git checkpoint (skip for non-committing cycles and research workflow)
+        if cycle_type.name == "spike" or is_research:
             checkpoint = type('obj', (object,), {'success': False, 'tag': ''})()
         else:
             checkpoint = create_checkpoint(cycle, state.session_id)
@@ -648,7 +655,10 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                 "starting any feature work."
             )
         elif is_first_cycle:
-            user_message = "Start a new development cycle. What's next?"
+            if is_research:
+                user_message = "Start a new research session. Review your tasks and begin investigating."
+            else:
+                user_message = "Start a new development cycle. What's next?"
         else:
             user_message = _build_continuation_prompt(
                 state, config, wrapping_up=wrapping_up,
@@ -723,9 +733,10 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                         error_hint = f": {cycle_result.output[:200]}"
                     summary = f"Cycle terminated abnormally{error_hint}"
 
-        # Independent health check — skip for non-code cycles
-        non_code_cycles = ("planning", "replan", "spike", "explore")
-        if cycle_type.name in non_code_cycles:
+        # Independent health check — skip for non-code cycles and research workflow
+        non_code_cycles = ("planning", "replan", "spike", "explore",
+                           "research", "synthesize")
+        if is_research or cycle_type.name in non_code_cycles:
             health = HealthCheckResult(passed=True)
             health.build_ok = None
             health.tests_ok = None
@@ -824,19 +835,22 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
 
         last_outcome = outcome
 
-        # Track work cycles for periodic test/cleanup/explore insertion
+        # Track work cycles for periodic test/cleanup/explore/synthesize insertion
         work_cycle_types = ("deep_work", "quick_fix", "continue_work",
-                            "refactor", "debug", "perf")
+                            "refactor", "debug", "perf", "research")
         if cycle_type.name in work_cycle_types and outcome != "failed":
             work_cycles_since_test += 1
             work_cycles_since_cleanup += 1
             work_cycles_since_explore += 1
+            work_cycles_since_synthesize += 1
         if cycle_type.name == "test":
             work_cycles_since_test = 0
         if cycle_type.name == "cleanup":
             work_cycles_since_cleanup = 0
         if cycle_type.name == "explore":
             work_cycles_since_explore = 0
+        if cycle_type.name == "synthesize":
+            work_cycles_since_synthesize = 0
 
         # Consecutive failure cap — stop burning cycles on structural failures
         if outcome == "failed":
@@ -932,7 +946,7 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                 and cycle_type.name in ("deep_work", "quick_fix", "continue_work",
                                         "test", "refactor", "debug", "perf",
                                         "cleanup", "spike", "security_audit",
-                                        "explore")
+                                        "explore", "research", "synthesize")
                 and outcome != "failed"
                 and not wrapping_up):
             replan_result = _run_micro_replan(

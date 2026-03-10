@@ -33,6 +33,8 @@ def select_cycle_type(
     work_cycles_since_cleanup: int = 0,
     has_architecture_map: bool = False,
     work_cycles_since_explore: int = 0,
+    workflow: str = "development",
+    work_cycles_since_synthesize: int = 0,
 ) -> CycleType:
     """Auto-select the appropriate cycle type based on context.
 
@@ -51,9 +53,23 @@ def select_cycle_type(
             memory/architecture.md. If False, an explore cycle is triggered early.
         work_cycles_since_explore: Number of work cycles since the last explore.
             After 15, auto-insert an explore cycle to refresh codebase understanding.
+        workflow: "development" (default) or "research". Research workflow uses
+            research/synthesize cycles instead of deep_work/test.
+        work_cycles_since_synthesize: Number of work cycles since the last synthesize
+            cycle. After 5, auto-insert a synthesize cycle (research workflow only).
     """
     if override and override in CYCLE_TYPES:
         return CYCLE_TYPES[override]
+
+    if workflow == "research":
+        return _select_research_cycle(
+            cycle, last_outcome, wrapping_up,
+            replan_interval=replan_interval,
+            consecutive_stalls=consecutive_stalls,
+            work_cycles_since_synthesize=work_cycles_since_synthesize,
+        )
+
+    # --- Development workflow (default) ---
 
     # Heal mode takes priority — project must be healthy before real work starts
     if not baseline_healthy:
@@ -101,3 +117,53 @@ def select_cycle_type(
         return CYCLE_TYPES["cleanup"]
 
     return CYCLE_TYPES["deep_work"]
+
+
+def _select_research_cycle(
+    cycle: int,
+    last_outcome: str | None,
+    wrapping_up: bool,
+    replan_interval: int = 0,
+    consecutive_stalls: int = 0,
+    work_cycles_since_synthesize: int = 0,
+) -> CycleType:
+    """Cycle selection for the research workflow.
+
+    Research workflow priority chain:
+    1. ship — if wrapping up
+    2. replan — if 2+ consecutive stalls
+    3. continue_work — if previous cycle stalled/timed out
+    4. planning — first cycle
+    5. explore — cycle 2 (understand codebase before researching)
+    6. replan — periodic (every N research cycles)
+    7. synthesize — periodic (every 5 research cycles)
+    8. research — default
+    """
+    if wrapping_up:
+        return CYCLE_TYPES["ship"]
+
+    if last_outcome in ("stalled", "timed_out"):
+        if consecutive_stalls >= 2:
+            return CYCLE_TYPES["replan"]
+        return CYCLE_TYPES["continue_work"]
+
+    if last_outcome == "failed":
+        return CYCLE_TYPES["replan"]
+
+    if cycle == 1:
+        return CYCLE_TYPES["planning"]
+
+    if cycle == 2:
+        return CYCLE_TYPES["explore"]
+
+    # Periodic replan
+    if replan_interval > 0 and cycle > 2:
+        work_cycle = cycle - 1
+        if work_cycle % replan_interval == 0:
+            return CYCLE_TYPES["replan"]
+
+    # Periodic synthesis: consolidate findings every 5 research cycles
+    if work_cycles_since_synthesize >= 5:
+        return CYCLE_TYPES["synthesize"]
+
+    return CYCLE_TYPES["research"]
