@@ -18,6 +18,8 @@ def _load_prompt(filename: str) -> str:
 # Core prompts
 BREWIN_SYSTEM_PROMPT = _load_prompt("system.md")
 MICRO_REPLAN_PROMPT = _load_prompt("micro_replan.md")
+PUA_OVERLAY_PROMPT = _load_prompt("pua_overlay.md")
+PUA_MICRO_REPLAN_PROMPT = _load_prompt("pua_micro_replan.md")
 
 # Cycle-type prompts (auto-discovered from cycles/ directory)
 CYCLE_PROMPTS: dict[str, str] = {

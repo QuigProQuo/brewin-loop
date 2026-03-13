@@ -220,8 +220,31 @@ Hook commands receive environment variables: `BREWIN_CYCLE`, `BREWIN_OUTCOME`, `
 | `--status` | — | Show last session status |
 | `--cycle-type` | auto | Force a cycle type (any from the tables above) |
 | `--no-rollback` | — | Disable automatic rollback on health check failure |
+| `--pua` | — | Enable PUA pressure (layers on any workflow) |
 
 Environment variables: `BREWIN_MODEL`, `BREWIN_TIME`, `BREWIN_MODE`, `BREWIN_MAX_CYCLES`
+
+### Workflows
+
+Set `workflow` in `.brewin/config.toml`:
+
+| Workflow | Default Cycle | Description |
+|----------|---------------|-------------|
+| `development` | `deep_work` | Standard code development with health checks, rollback, git checkpoints |
+| `research` | `research` | Investigation-focused — no health checks, uses WebSearch/WebFetch, periodic synthesis |
+
+### PUA (Prompt Underperformance Analyzer)
+
+PUA layers on top of any workflow. When enabled, consecutive failures trigger escalating `pua_pressure` cycles (SEMER methodology) instead of stopping the session. Raises the failure cap from 3 to 6.
+
+```toml
+workflow = "development"  # or "research" — PUA works with either
+pua = true
+```
+
+Or via CLI: `brewin --time 60 --pua "Fix the auth bug"`
+
+For the full CLI reference, see [docs/CLI.md](docs/CLI.md).
 
 ## License
 

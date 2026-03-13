@@ -62,6 +62,11 @@ class BrewinConfig:
     # Workflow — "development" (default) or "research" (no health checks, research cycles)
     workflow: str = "development"
 
+    # PUA — enable PUA (Prompt Underperformance Analyzer) pressure cycles.
+    # Layers on top of any workflow. On consecutive failures, triggers escalating
+    # pua_pressure cycles instead of stopping. Raises failure cap from 3 to 6.
+    pua: bool = False
+
     # Prompt limits
     max_prompt_chars: int = 15000
 
@@ -161,6 +166,9 @@ def load_config(agent_name: str | None = None, **overrides) -> BrewinConfig:
 
     if "workflow" in toml_data:
         config.workflow = toml_data["workflow"]
+
+    if "pua" in toml_data:
+        config.pua = bool(toml_data["pua"])
 
     if "cycle_type" in toml_data:
         config.cycle_type_override = toml_data["cycle_type"]

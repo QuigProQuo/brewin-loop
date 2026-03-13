@@ -38,7 +38,10 @@ from brewin.context import (
 from brewin.cycles import select_cycle_type
 from brewin.hooks import run_hooks, build_hook_env
 from brewin.worktree import create_agent_worktree, remove_agent_worktree, get_agent_branch
-from brewin.prompts import BREWIN_SYSTEM_PROMPT, MICRO_REPLAN_PROMPT
+from brewin.prompts import (
+    BREWIN_SYSTEM_PROMPT, MICRO_REPLAN_PROMPT,
+    PUA_OVERLAY_PROMPT, PUA_MICRO_REPLAN_PROMPT,
+)
 
 console = Console()
 
@@ -135,7 +138,8 @@ def _run_micro_replan(
     tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md")) or "(empty)"
     mem = load_structured_memory(config.state_dir)
 
-    prompt = MICRO_REPLAN_PROMPT.format(
+    template = PUA_MICRO_REPLAN_PROMPT if config.pua else MICRO_REPLAN_PROMPT
+    prompt = template.format(
         focus=focus, outcome=outcome, summary=summary,
         tasks=tasks,
         memory_architecture=mem.get("architecture") or "(empty)",
@@ -144,13 +148,20 @@ def _run_micro_replan(
         memory_learnings=mem.get("learnings") or "(empty)",
     )
 
+    replan_system = (
+        "You are Brewin's task planner. You update task backlogs and memory files. "
+        "You do NOT write application code. Be concise and fast."
+    )
+    if config.pua:
+        replan_system += (
+            " You also evaluate cycle quality for underperformance patterns "
+            "(brute-force retries, blame-shifting, idle tools, busywork). "
+            "Capture failure analysis and alternative approaches in memory."
+        )
     console.print("  [dim]Running micro-replan...[/dim]")
     result = run_cycle(
         user_message=prompt,
-        system_prompt=(
-            "You are Brewin's task planner. You update task backlogs and memory files. "
-            "You do NOT write application code. Be concise and fast."
-        ),
+        system_prompt=replan_system,
         model=config.replan_model or config.model,
         timeout=120,
     )
@@ -180,6 +191,10 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
         prompt = prompt.replace(".brewin/tasks.md", f"{state_dir}/tasks.md")
         prompt = prompt.replace(".brewin/memory/", f"{state_dir}/memory/")
     sections = []
+
+    # PUA overlay — behavioral rules injected into ALL cycles when enabled
+    if config.pua:
+        sections.append(PUA_OVERLAY_PROMPT)
 
     # Cycle type mode
     if cycle_type_addendum:
@@ -451,7 +466,8 @@ def run_brewin(config: BrewinConfig, initial_direction: str | None = None,
             f"  Project:      [cyan]{project_type}[/cyan]\n"
             f"  Model:        [cyan]{config.model}[/cyan]\n"
             f"  Mode:         [cyan]{config.autonomy_mode}[/cyan]\n"
-            f"  Session:      [dim]{state.session_id}[/dim]"
+            + (f"  PUA:          [red]enabled[/red]\n" if config.pua else "")
+            + f"  Session:      [dim]{state.session_id}[/dim]"
             + agent_info
             + (f"\n  Direction:    [green]{initial_direction}[/green]"
                if initial_direction else ""),
@@ -588,6 +604,8 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
             work_cycles_since_explore=work_cycles_since_explore,
             workflow=config.workflow,
             work_cycles_since_synthesize=work_cycles_since_synthesize,
+            consecutive_failures=consecutive_failures,
+            pua=config.pua,
         )
 
         remaining = state.format_time_remaining(config.time_budget_minutes)
@@ -597,7 +615,13 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
         )
         if wrapping_up:
             label += " [yellow](WRAP-UP)[/yellow]"
-        console.print(Panel(label, border_style="yellow" if wrapping_up else "cyan"))
+        # PUA escalation level indicator
+        if cycle_type.name == "pua_pressure":
+            pua_trigger = max(consecutive_failures, consecutive_stalls)
+            pua_level = min(max(pua_trigger - 1, 1), 4)
+            pua_labels = {1: "L1 — Nudge", 2: "L2 — Investigate", 3: "L3 — Checklist", 4: "L4 — All-out"}
+            label += f" [red](PUA {pua_labels[pua_level]})[/red]"
+        console.print(Panel(label, border_style="red" if cycle_type.name == "pua_pressure" else ("yellow" if wrapping_up else "cyan")))
 
         # Confirm-first mode
         if config.autonomy_mode == "confirm-first" and cycle > 1:
@@ -640,11 +664,49 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
                 test_cmd=config.health_check_test,
             )
 
+        # For PUA pressure cycles, inject escalation level into the addendum
+        # Escalation is driven by the worse of consecutive failures or stalls
+        effective_addendum = cycle_type.prompt_addendum
+        if cycle_type.name == "pua_pressure":
+            pua_trigger = max(consecutive_failures, consecutive_stalls)
+            pua_level = min(pua_trigger - 1, 4)
+            trigger_type = "failure" if consecutive_failures >= consecutive_stalls else "stall"
+            pua_escalation = {
+                1: (
+                    f"### Escalation: L1 — Nudge\n"
+                    f"This is consecutive {trigger_type} #{pua_trigger}. Switch to a fundamentally "
+                    f"different approach. Whatever you were trying is NOT working."
+                ),
+                2: (
+                    f"### Escalation: L2 — Investigate\n"
+                    f"This is consecutive {trigger_type} #{pua_trigger}. You MUST:\n"
+                    "- Search the codebase for the error string and read the source\n"
+                    "- Read git history for when this code last worked\n"
+                    "- Find a working example of a similar pattern in the codebase\n"
+                    "Do NOT write any code until you've completed the SMELL and ELEVATE steps."
+                ),
+                3: (
+                    f"### Escalation: L3 — Full Checklist\n"
+                    f"This is consecutive {trigger_type} #{pua_trigger}. Execute the 7-Point Systematic "
+                    "Checklist above EXHAUSTIVELY. Check every single item. Document your "
+                    "findings for each point before attempting any fix."
+                ),
+                4: (
+                    f"### Escalation: L4 — All-Out\n"
+                    f"This is consecutive {trigger_type} #{pua_trigger}. You must exhaust EVERY "
+                    "available tool and approach. Try the approach that seems most unlikely. "
+                    "Your mental model of this problem is wrong — challenge every assumption. "
+                    "If you still cannot fix it, implement a workaround and document exactly "
+                    "what's blocking the proper fix in memory/learnings.md."
+                ),
+            }
+            effective_addendum += "\n\n" + pua_escalation.get(pua_level, pua_escalation[4])
+
         system_prompt = _build_system_prompt(
             state, config,
             initial_direction=initial_direction if is_first_cycle else None,
             wrapping_up=wrapping_up,
-            cycle_type_addendum=cycle_type.prompt_addendum,
+            cycle_type_addendum=effective_addendum,
             health_context=heal_health_context,
             timeout_context=last_timeout_context,
         )
@@ -853,11 +915,13 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
             work_cycles_since_synthesize = 0
 
         # Consecutive failure cap — stop burning cycles on structural failures
+        # PUA raises the cap to 6 (pushes through with escalating pressure)
+        failure_cap = 6 if config.pua else 3
         if outcome == "failed":
             consecutive_failures += 1
-            if consecutive_failures >= 3:
+            if consecutive_failures >= failure_cap:
                 console.print(
-                    "[red]3 consecutive failures — stopping to avoid "
+                    f"[red]{failure_cap} consecutive failures — stopping to avoid "
                     "wasting cycles.[/red]"
                 )
                 break
@@ -942,12 +1006,18 @@ def _run_main_loop(config: BrewinConfig, state: BrewinState,
         run_hooks(config.post_cycle_hooks, "post-cycle", env_extras=hook_env)
 
         # Micro-replan: quick task update after work cycles (not after replan/planning/ship)
+        # With PUA enabled, also run micro-replan after failed and pua_pressure cycles
+        # to capture failure patterns in memory
+        pua_replan_eligible = config.pua and (
+            cycle_type.name == "pua_pressure" or outcome == "failed"
+        )
         if (config.micro_replan
-                and cycle_type.name in ("deep_work", "quick_fix", "continue_work",
-                                        "test", "refactor", "debug", "perf",
-                                        "cleanup", "spike", "security_audit",
-                                        "explore", "research", "synthesize")
-                and outcome != "failed"
+                and (cycle_type.name in ("deep_work", "quick_fix", "continue_work",
+                                         "test", "refactor", "debug", "perf",
+                                         "cleanup", "spike", "security_audit",
+                                         "explore", "research", "synthesize")
+                     or pua_replan_eligible)
+                and (outcome != "failed" or pua_replan_eligible)
                 and not wrapping_up):
             replan_result = _run_micro_replan(
                 state, config, focus, outcome, summary,
@@ -1134,6 +1204,7 @@ def main():
                             "planning", "quick_fix", "deep_work", "review", "replan", "heal",
                             "spike", "test", "refactor", "debug", "ship",
                             "security_audit", "perf", "cleanup", "explore",
+                            "pua_pressure",
                         ],
                         default=None, help="Force a specific cycle type for all cycles")
     parser.add_argument("--no-rollback", action="store_true",
@@ -1144,6 +1215,8 @@ def main():
                         help="Insert full replan cycle every N work cycles (0=disabled)")
     parser.add_argument("--stall-timeout", type=int, default=None,
                         help="Seconds with no output before killing a cycle (default: 300)")
+    parser.add_argument("--pua", action="store_true",
+                        help="Enable PUA pressure cycles on consecutive failures (layers on any workflow)")
 
     args = parser.parse_args()
 
@@ -1159,6 +1232,8 @@ def main():
         config.rollback_on_failure = False
     if args.no_replan:
         config.micro_replan = False
+    if args.pua or args.cycle_type == "pua_pressure":
+        config.pua = True
     if args.replan_interval is not None:
         config.replan_interval = args.replan_interval
     if args.stall_timeout is not None:

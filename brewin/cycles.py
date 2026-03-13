@@ -35,6 +35,8 @@ def select_cycle_type(
     work_cycles_since_explore: int = 0,
     workflow: str = "development",
     work_cycles_since_synthesize: int = 0,
+    consecutive_failures: int = 0,
+    pua: bool = False,
 ) -> CycleType:
     """Auto-select the appropriate cycle type based on context.
 
@@ -43,6 +45,8 @@ def select_cycle_type(
             E.g., replan_interval=4 means cycles 5, 9, 13... are replan cycles.
         consecutive_stalls: Number of consecutive stalled cycles. After 2+,
             escalate to replan instead of continue_work.
+        consecutive_failures: Number of consecutive failed cycles. In PUA workflow,
+            triggers pua_pressure cycles at 2+ instead of stopping at 3.
         baseline_healthy: Whether the project was healthy at session start.
             If False, the first cycle(s) will be heal cycles until health passes.
         work_cycles_since_test: Number of work cycles since the last test cycle.
@@ -67,6 +71,8 @@ def select_cycle_type(
             replan_interval=replan_interval,
             consecutive_stalls=consecutive_stalls,
             work_cycles_since_synthesize=work_cycles_since_synthesize,
+            pua=pua,
+            consecutive_failures=consecutive_failures,
         )
 
     # --- Development workflow (default) ---
@@ -78,11 +84,17 @@ def select_cycle_type(
     if wrapping_up:
         return CYCLE_TYPES["ship"]
 
+    # PUA pressure: escalating debugging on consecutive failures
+    if pua and consecutive_failures >= 2 and "pua_pressure" in CYCLE_TYPES:
+        return CYCLE_TYPES["pua_pressure"]
+
     # On-demand explore: agent requested exploration via cycle outcome
     if last_outcome == "needs_exploration":
         return CYCLE_TYPES["explore"]
 
     if last_outcome in ("stalled", "timed_out"):
+        if pua and consecutive_stalls >= 3 and "pua_pressure" in CYCLE_TYPES:
+            return CYCLE_TYPES["pua_pressure"]
         if consecutive_stalls >= 2:
             return CYCLE_TYPES["replan"]
         return CYCLE_TYPES["continue_work"]
@@ -126,23 +138,32 @@ def _select_research_cycle(
     replan_interval: int = 0,
     consecutive_stalls: int = 0,
     work_cycles_since_synthesize: int = 0,
+    pua: bool = False,
+    consecutive_failures: int = 0,
 ) -> CycleType:
     """Cycle selection for the research workflow.
 
     Research workflow priority chain:
     1. ship — if wrapping up
-    2. replan — if 2+ consecutive stalls
-    3. continue_work — if previous cycle stalled/timed out
-    4. planning — first cycle
-    5. explore — cycle 2 (understand codebase before researching)
-    6. replan — periodic (every N research cycles)
-    7. synthesize — periodic (every 5 research cycles)
-    8. research — default
+    2. pua_pressure — if pua enabled and 2+ consecutive failures
+    3. replan — if 2+ consecutive stalls
+    4. continue_work — if previous cycle stalled/timed out
+    5. planning — first cycle
+    6. explore — cycle 2 (understand codebase before researching)
+    7. replan — periodic (every N research cycles)
+    8. synthesize — periodic (every 5 research cycles)
+    9. research — default
     """
     if wrapping_up:
         return CYCLE_TYPES["ship"]
 
+    # PUA pressure: escalating debugging on consecutive failures
+    if pua and consecutive_failures >= 2 and "pua_pressure" in CYCLE_TYPES:
+        return CYCLE_TYPES["pua_pressure"]
+
     if last_outcome in ("stalled", "timed_out"):
+        if pua and consecutive_stalls >= 3 and "pua_pressure" in CYCLE_TYPES:
+            return CYCLE_TYPES["pua_pressure"]
         if consecutive_stalls >= 2:
             return CYCLE_TYPES["replan"]
         return CYCLE_TYPES["continue_work"]

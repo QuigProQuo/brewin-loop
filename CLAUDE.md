@@ -20,6 +20,8 @@ brewin/
     __init__.py    — Loader (auto-discovers cycle files at import time)
     system.md      — Core agent instructions (BREWIN_SYSTEM_PROMPT)
     micro_replan.md — Post-cycle task/memory update prompt
+    pua_overlay.md — PUA behavioral rules injected into all cycles when pua=true
+    pua_micro_replan.md — Enhanced micro-replan with failure analysis (pua=true)
     cycles/*.md    — One file per cycle type (filename = cycle name)
 ```
 
@@ -37,17 +39,19 @@ brewin/
 
 1. **heal** — if baseline health check failed
 2. **ship** — if wrapping up (near time limit)
-3. **explore** — if agent reported `needs_exploration` outcome
-4. **replan** — if 2+ consecutive stalls
-5. **continue_work** — if previous cycle stalled/timed out
-6. **review** — if previous cycle failed
-7. **planning** — first cycle of session
-8. **explore** — cycle 2 if no architecture map exists in memory/
-9. **replan** — periodic (every N work cycles)
-10. **test** — periodic (every 8 work cycles)
-11. **explore** — periodic (every 15 work cycles)
-12. **cleanup** — periodic (every 10 work cycles)
-13. **deep_work** — default
+3. **pua_pressure** — if 2+ consecutive failures (when `pua = true`)
+4. **explore** — if agent reported `needs_exploration` outcome
+5. **pua_pressure** — if 3+ consecutive stalls (when `pua = true`)
+6. **replan** — if 2+ consecutive stalls
+7. **continue_work** — if previous cycle stalled/timed out
+8. **review** — if previous cycle failed
+9. **planning** — first cycle of session
+10. **explore** — cycle 2 if no architecture map exists in memory/
+11. **replan** — periodic (every N work cycles)
+12. **test** — periodic (every 8 work cycles)
+13. **explore** — periodic (every 15 work cycles)
+14. **cleanup** — periodic (every 10 work cycles)
+15. **deep_work** — default
 
 ## Workflows
 
@@ -72,13 +76,47 @@ test = "true"
 
 Research cycle selection priority chain:
 1. **ship** — wrapping up
-2. **replan** — 2+ consecutive stalls, or failed
-3. **continue_work** — previous cycle stalled/timed out
-4. **planning** — first cycle
-5. **explore** — cycle 2 (understand codebase)
-6. **replan** — periodic
-7. **synthesize** — every 5 research cycles
-8. **research** — default
+2. **pua_pressure** — if 2+ consecutive failures (when `pua = true`)
+3. **pua_pressure** — if 3+ consecutive stalls (when `pua = true`)
+4. **replan** — 2+ consecutive stalls, or failed
+5. **continue_work** — previous cycle stalled/timed out
+6. **planning** — first cycle
+7. **explore** — cycle 2 (understand codebase)
+8. **replan** — periodic
+9. **synthesize** — every 5 research cycles
+10. **research** — default
+
+### PUA (overlay, not a workflow)
+
+PUA (Prompt Underperformance Analyzer) is a toggle that layers on top of any
+workflow. Enable with `pua = true` in config.toml or `--pua` on the CLI.
+
+```toml
+workflow = "development"  # or "research" — PUA works with either
+pua = true
+```
+
+PUA integrates at 4 levels:
+
+1. **System prompt overlay** — Every cycle gets PUA behavioral rules (iron rules,
+   anti-patterns, proactivity standards) injected into the system prompt via
+   `prompts/pua_overlay.md`. This raises the quality bar for all cycle types.
+
+2. **Pressure cycles** — On 2+ consecutive failures OR 3+ consecutive stalls,
+   triggers `pua_pressure` cycles with SEMER methodology and escalating pressure:
+   - **L1 (2 failures / 3 stalls)** — Nudge: switch approaches
+   - **L2 (3 failures / 4 stalls)** — Investigate: systematic source reading
+   - **L3 (4)** — Checklist: 7-point systematic debugging
+   - **L4 (5+)** — All-out: exhaust every tool and approach
+   Raises failure cap from 3 to 6.
+
+3. **Enhanced micro-replan** — Uses `prompts/pua_micro_replan.md` instead of the
+   standard micro-replan. Adds failure analysis, lazy pattern detection, and
+   alternative approach suggestions to memory updates.
+
+4. **Failure micro-replan** — Normally micro-replan skips failed cycles. With PUA,
+   it runs after failures and pua_pressure cycles to capture failure patterns in
+   memory so the next cycle doesn't repeat mistakes.
 
 ## Key Patterns
 
