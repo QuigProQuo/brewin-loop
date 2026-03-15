@@ -129,6 +129,33 @@ def has_architecture_map(state_dir: str) -> bool:
         return False
 
 
+def load_shared_discoveries(agent_name: str | None = None,
+                            state_dir: str | None = None,
+                            max_chars: int = 500) -> str:
+    """Load cross-agent discoveries for system prompt injection.
+
+    Args:
+        agent_name: Current agent's name (to exclude own discoveries).
+        state_dir: The agent's state_dir (e.g. /path/.brewin/agents/frontend).
+                   Used to derive the root .brewin/ path for shared discoveries.
+        max_chars: Max total content chars.
+
+    Returns formatted string of discoveries from other agents, or empty string
+    if no discoveries exist or not in agent mode.
+    """
+    if not agent_name:
+        return ""
+
+    from brewin.discoveries import (
+        read_discoveries, format_discoveries, brewin_dir_from_state_dir,
+    )
+    brewin_dir = brewin_dir_from_state_dir(state_dir) if state_dir else None
+    discoveries = read_discoveries(
+        exclude_agent=agent_name, max_chars=max_chars, brewin_dir=brewin_dir,
+    )
+    return format_discoveries(discoveries)
+
+
 def get_health_summary(build_ok: bool | None, tests_ok: bool | None,
                        test_output: str = "", build_output: str = "",
                        build_cmd: str | None = None,

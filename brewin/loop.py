@@ -34,6 +34,7 @@ from brewin.healthcheck import run_health_check, health_regressed, is_likely_con
 from brewin.context import (
     get_git_context, get_project_tree, get_health_summary,
     get_recently_changed_files, load_structured_memory, has_architecture_map,
+    load_shared_discoveries,
 )
 from brewin.cycles import select_cycle_type
 from brewin.hooks import run_hooks, build_hook_env
@@ -130,6 +131,52 @@ def _fallback_memory_update(
         console.print(f"  [dim red]Fallback memory write failed: {e}[/dim red]")
 
 
+_DISCOVERY_INSTRUCTIONS = (
+    "10. **Discoveries for other agents:** If this cycle uncovered information that "
+    "would be useful to other agents working on this project (API patterns, auth "
+    "mechanisms, config details, dependency constraints, architectural decisions), "
+    "emit one DISCOVERY line per finding in this format:\n"
+    "DISCOVERY[type|tag1,tag2]: description of the finding\n"
+    "Types: architecture, api, config, dependency, convention, bug\n"
+    "Example: DISCOVERY[architecture|auth]: Auth uses RS256 JWT, public key at /keys/jwt-public.pem"
+)
+
+
+def _extract_discoveries(output: str, config: BrewinConfig) -> None:
+    """Parse DISCOVERY[] lines from cycle output and write to shared feed."""
+    if not config.agent_name:
+        return
+
+    from brewin.discoveries import write_discovery, brewin_dir_from_state_dir
+    brewin_dir = brewin_dir_from_state_dir(config.state_dir)
+
+    for line in output.splitlines():
+        line = line.strip()
+        if not line.startswith("DISCOVERY["):
+            continue
+        try:
+            # DISCOVERY[type|tag1,tag2]: content
+            bracket_end = line.index("]")
+            meta = line[len("DISCOVERY["):bracket_end]
+            content = line[bracket_end + 1:].lstrip(": ")
+
+            parts = meta.split("|", 1)
+            discovery_type = parts[0].strip()
+            tags = [t.strip() for t in parts[1].split(",")] if len(parts) > 1 else []
+
+            if content:
+                write_discovery(
+                    agent_name=config.agent_name,
+                    content=content,
+                    discovery_type=discovery_type,
+                    tags=tags,
+                    brewin_dir=brewin_dir,
+                )
+                console.print(f"  [dim]Discovery shared: [{discovery_type}] {content[:60]}[/dim]")
+        except (ValueError, IndexError):
+            continue
+
+
 def _run_micro_replan(
     state: BrewinState, config: BrewinConfig,
     focus: str, outcome: str, summary: str,
@@ -137,6 +184,9 @@ def _run_micro_replan(
     """Run a quick, cheap replan call to update tasks and memory after a work cycle."""
     tasks = _read_file_safe(os.path.join(config.state_dir, "tasks.md")) or "(empty)"
     mem = load_structured_memory(config.state_dir)
+
+    # Include discovery instructions when running in agent mode (parallel)
+    discovery_instructions = _DISCOVERY_INSTRUCTIONS if config.agent_name else ""
 
     template = PUA_MICRO_REPLAN_PROMPT if config.pua else MICRO_REPLAN_PROMPT
     prompt = template.format(
@@ -146,6 +196,7 @@ def _run_micro_replan(
         memory_decisions=mem.get("decisions") or "(empty)",
         memory_state=mem.get("state") or "(empty)",
         memory_learnings=mem.get("learnings") or "(empty)",
+        discovery_instructions=discovery_instructions,
     )
 
     replan_system = (
@@ -172,6 +223,9 @@ def _run_micro_replan(
             config, state.cycle_count + 1, focus, outcome, summary,
         )
         return None
+
+    # Extract and share discoveries from micro-replan output
+    _extract_discoveries(result.output, config)
 
     console.print("  [dim]Micro-replan complete.[/dim]")
     return result
@@ -254,6 +308,14 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
             "end of this cycle (see MEMORY section above for file names)."
         )
 
+    # Discoveries from other agents (parallel mode only)
+    if config.agent_name:
+        discoveries = load_shared_discoveries(
+            config.agent_name, state_dir=config.state_dir,
+        )
+        if discoveries:
+            sections.append(f"## Discoveries from Other Agents\n{discoveries}")
+
     # Git context
     git_ctx = get_git_context()
     if git_ctx:
@@ -308,6 +370,7 @@ def _build_system_prompt(state: BrewinState, config: BrewinConfig,
         # Drop in order: project structure, decisions, active dev areas, learnings
         drop_order = [
             "## Project Structure",
+            "## Discoveries from Other Agents",
             "### Decisions",
             "## Active Development Areas",
             "### Learnings",

@@ -11,7 +11,8 @@ brewin/
   cycles.py        — Cycle type definitions + selection algorithm
   config.py        — Config loading from .brewin/config.toml + CLI args
   state.py         — Session state persistence (state.json), cycle logging
-  context.py       — Git context, project tree, health summaries, structured memory loading
+  context.py       — Git context, project tree, health summaries, structured memory, discovery loading
+  discoveries.py   — Cross-agent discovery sharing via append-only JSONL
   healthcheck.py   — Independent build/test verification, regression detection
   checkpoint.py    — Git tag checkpoints and rollback
   hooks.py         — Pre/post-cycle hook execution
@@ -117,6 +118,24 @@ PUA integrates at 4 levels:
 4. **Failure micro-replan** — Normally micro-replan skips failed cycles. With PUA,
    it runs after failures and pua_pressure cycles to capture failure patterns in
    memory so the next cycle doesn't repeat mistakes.
+
+## Cross-Agent Discovery Sharing
+
+When running in agent mode (parallel via brewin-agent), agents can share findings
+with each other through `.brewin/shared/discoveries.jsonl`. This is an append-only
+JSONL file at the project root (NOT in the worktree).
+
+**Writing discoveries:** During micro-replan, Claude can emit `DISCOVERY[type|tags]: content`
+lines. These are parsed by `_extract_discoveries()` in loop.py and appended to the shared file.
+
+**Reading discoveries:** Each cycle's system prompt includes a `## Discoveries from Other Agents`
+section (when in agent mode) with recent discoveries from OTHER agents, capped at 500 chars.
+
+**Path resolution:** Since agents run in worktrees, the discoveries path is resolved from
+`config.state_dir` (which is absolute) by walking up to the root `.brewin/` directory via
+`brewin_dir_from_state_dir()`.
+
+Discovery types: `architecture`, `api`, `config`, `dependency`, `convention`, `bug`
 
 ## Key Patterns
 

@@ -56,6 +56,8 @@ Additionally, evaluate this cycle for underperformance patterns:
 
 Do NOT write application code. Only update the tasks and memory files in the state directory.
 
+{discovery_instructions}
+
 End with:
 ```json
 {{"cycle_focus": "micro-replan", "cycle_outcome": "success", "cycle_summary": "<what you updated>"}}
